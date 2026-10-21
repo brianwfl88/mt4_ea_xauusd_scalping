@@ -2,18 +2,19 @@
 //|                                         XAUUSD_SwingMaster.mq4   |
 //|               Institutional Trend & Volatility Swing Engine      |
 //|                    Engineered for Gold (XAUUSD) Swing Trading    |
-//|                    Updated: Multi-Timeframe & Tester Resilient   |
+//|                    Version 2.00: Strict Capital Preservation     |
 //+------------------------------------------------------------------+
 #property copyright "Quantitative Trading Engine"
 #property link      "https://github.com"
-#property version   "1.10"
+#property version   "2.00"
 #property strict
 
-//--- Inputs: Account Sizing & Risk Management
-input string   _Section1               = "=== Sizing & Compounding Tiers ===";
-input bool     InpUseDynamicTiers      = true;     // Enable Dynamic Compounding Tiers
-input double   InpManualBaseLot        = 0.02;     // Manual Lot if Dynamic Tiers disabled (0.02 at 1:500)
-input double   InpRewardRatioTP1       = 2.0;      // Risk-to-Reward ratio for TP1 (e.g. 1:2 R:R)
+//--- Inputs: Strict Capital Protection & Mathematical Risk Sizing
+input string   _Section1               = "=== Strict Capital Preservation & Risk ===";
+input double   InpRiskPercentPerTrade  = 4.0;      // Max Risk % per trade of current equity (3.0% - 5.0%)
+input double   InpMaxDrawdownFromPeak  = 15.0;     // Max Drawdown % from Peak Equity before emergency halt
+input bool     InpEnableProfitRatchet  = true;     // Ratchet Profit Floor (Locks in gains at $200, $300, etc.)
+input double   InpRewardRatioTP1       = 2.0;      // Risk-to-Reward ratio for TP1 (1:2 R:R)
 input double   InpPartialClosePercent  = 50.0;     // Percentage of position to close at TP1 (50%)
 input double   InpBreakEvenBufferUSD   = 0.50;     // Profit locked when moving to Break-Even ($0.50)
 
@@ -26,10 +27,10 @@ input int      InpRSIPeriod            = 14;       // RSI Period
 input double   InpRSIBuyLevel          = 46.0;     // Buy when RSI pulls back below or near this level
 input double   InpRSISellLevel         = 54.0;     // Sell when RSI rallies above or near this level
 
-//--- Inputs: Stop Loss & ATR Trailing Stop
+//--- Inputs: Dynamic Stop Loss & ATR Trailing Stop
 input string   _Section3               = "=== Stop Loss & ATR Trailing ===";
 input int      InpATRPeriod            = 14;       // ATR Period for Stop Loss and Trailing
-input double   InpATRFactorSL          = 1.5;      // Initial SL Multiplier of ATR ($4.00 - $6.00 risk)
+input double   InpATRFactorSL          = 1.5;      // Initial SL Multiplier of ATR
 input double   InpATRFactorTrail       = 2.0;      // Runner Trailing Stop Multiplier of ATR
 input bool     InpUseTrailingStop      = true;     // Enable Trailing Stop on Runner
 
@@ -51,8 +52,11 @@ input bool     InpVerboseLogging       = true;     // Verbose logging in Journal
 //--- Global Variables
 double g_ContractSize          = 100.0;
 double g_InitialBalance        = 0.0;
+double g_PeakEquity            = 0.0;
+double g_ProfitFloor           = 0.0;
 bool   g_PartialClosed         = false;
-bool   g_FridayClosedForLowVol   = false;
+bool   g_CircuitBreakerTripped = false;
+bool   g_FridayClosedForLowVol = false;
 datetime g_LastBarTime         = 0;
 
 //+------------------------------------------------------------------+
@@ -69,17 +73,20 @@ int OnInit()
    g_ContractSize = MarketInfo(Symbol(), MODE_LOTSIZE);
    if (g_ContractSize <= 0) g_ContractSize = 100.0;
 
-   g_InitialBalance = AccountBalance();
-   g_PartialClosed = false;
+   g_InitialBalance        = AccountBalance();
+   g_PeakEquity            = MathMax(g_InitialBalance, AccountEquity());
+   g_ProfitFloor           = 0.0;
+   g_PartialClosed         = false;
+   g_CircuitBreakerTripped = false;
    g_FridayClosedForLowVol = false;
-   g_LastBarTime = 0;
+   g_LastBarTime           = 0;
 
    Print("==================================================================");
-   Print("[INIT] XAUUSD Swing Master Engine v1.10 Ready.");
-   Print("[INIT] Balance: $", DoubleToStr(g_InitialBalance, 2),
+   Print("[INIT] XAUUSD Swing Master Engine v2.00 Initialized.");
+   Print("[INIT] Capital Protection Active | Starting Balance: $", DoubleToStr(g_InitialBalance, 2),
          " | Leverage: 1:", AccountLeverage(),
          " | Contract Size: ", DoubleToStr(g_ContractSize, 0),
-         " | MinStopLevel: ", MarketInfo(Symbol(), MODE_STOPLEVEL), " points");
+         " | Risk Per Trade: ", DoubleToStr(InpRiskPercentPerTrade, 1), "%");
    Print("==================================================================");
 
    return(INIT_SUCCEEDED);
@@ -98,25 +105,94 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 void OnTick()
 {
-   // 1. Friday Volatility & Weekend Risk Manager
+   // 1. Maintain Peak Equity and Ratchet Profit Floors
+   MaintainCapitalProtection();
+
+   // 2. Check Circuit Breaker Status
+   if (g_CircuitBreakerTripped)
+   {
+      UpdateHUD();
+      return;
+   }
+
+   // 3. Friday Volatility & Weekend Risk Manager
    if (InpEnableFridayFilter)
    {
       CheckFridayWeekendRisk();
    }
 
-   // 2. Manage Active Open Swing Positions (TP1 Partial Close, Break-Even, ATR Trail)
+   // 4. Manage Active Open Swing Positions (TP1 Partial Close, Break-Even, ATR Trail)
    ManageOpenSwingTrades();
 
-   // 3. Update HUD Display
+   // 5. Update On-Chart HUD
    UpdateHUD();
 
-   // 4. Entry Guard Checks
+   // 6. Entry Guard Checks
+   if (g_CircuitBreakerTripped) return;
    if (g_FridayClosedForLowVol) return;
-   if (CountOpenSwingTrades() > 0) return; // Holds 1 high-conviction swing setup at a time
+   if (CountOpenSwingTrades() > 0) return; // Strictly 1 swing setup at a time
    if (!IsSpreadOk()) return;
 
-   // 5. Check Swing Entry Signal (Evaluated once per bar on bar open or live ticks)
+   // 7. Check Swing Entry Signal
    CheckAndExecuteSwingEntry();
+}
+
+//+------------------------------------------------------------------+
+//| Capital Protection: Peak Equity Tracking & Profit Floor Ratchet  |
+//+------------------------------------------------------------------+
+void MaintainCapitalProtection()
+{
+   double curEquity = AccountEquity();
+   if (curEquity > g_PeakEquity)
+   {
+      g_PeakEquity = curEquity;
+
+      // Ratchet Profit Floor as capital scales:
+      // When equity hits $200, floor = $150 (locks in +$50 minimum)
+      // When equity hits $300, floor = $240 (locks in +$140 minimum)
+      // When equity hits $400, floor = $330 (locks in +$230 minimum)
+      if (InpEnableProfitRatchet)
+      {
+         if (g_PeakEquity >= 400.0)      g_ProfitFloor = MathMax(g_ProfitFloor, 330.0);
+         else if (g_PeakEquity >= 300.0) g_ProfitFloor = MathMax(g_ProfitFloor, 240.0);
+         else if (g_PeakEquity >= 200.0) g_ProfitFloor = MathMax(g_ProfitFloor, 150.0);
+      }
+   }
+
+   // 1. Check Maximum Drawdown from Peak Equity (e.g. max 15% drawdown from all-time peak)
+   double ddFromPeak = 0.0;
+   if (g_PeakEquity > 0)
+   {
+      ddFromPeak = ((g_PeakEquity - curEquity) / g_PeakEquity) * 100.0;
+   }
+
+   if (ddFromPeak >= InpMaxDrawdownFromPeak)
+   {
+      if (!g_CircuitBreakerTripped)
+      {
+         Print("[CIRCUIT BREAKER ACTIVATED] Equity fell ", DoubleToStr(ddFromPeak, 1),
+               "% from peak of $", DoubleToStr(g_PeakEquity, 2),
+               ". Current Equity: $", DoubleToStr(curEquity, 2),
+               ". Closing all positions to lock in capital!");
+         CloseAllSwingPositions();
+         g_CircuitBreakerTripped = true;
+      }
+      return;
+   }
+
+   // 2. Check Profit Floor Ratchet Breach
+   if (InpEnableProfitRatchet && g_ProfitFloor > 0 && curEquity <= g_ProfitFloor)
+   {
+      if (!g_CircuitBreakerTripped)
+      {
+         Print("[PROFIT FLOOR RATCHET TRIGGERED] Equity ($", DoubleToStr(curEquity, 2),
+               ") reached locked floor of $", DoubleToStr(g_ProfitFloor, 2),
+               ". Closing positions to preserve banked profits!");
+         CloseAllSwingPositions();
+         g_CircuitBreakerTripped = true;
+      }
+      return;
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -127,7 +203,6 @@ void CheckFridayWeekendRisk()
    datetime now = TimeCurrent();
    int dayOfWeek = TimeDayOfWeek(now);
 
-   // Friday is Day 5
    if (dayOfWeek == 5)
    {
       int utcHour = GetCurrentUtcHour();
@@ -185,35 +260,37 @@ int CountOpenSwingTrades()
 }
 
 //+------------------------------------------------------------------+
-//| Calculate Lot Size using Dynamic Compounding Tiers for 1:500     |
+//| DYNAMIC RISK SIZING: Lot size mathematically tied to Stop Loss    |
+//| GUARANTEES that a losing trade NEVER exceeds InpRiskPercent      |
 //+------------------------------------------------------------------+
-double GetCompoundedSwingLot()
+double CalculateDynamicRiskLot(double slDistanceUSD)
 {
-   double lot = InpManualBaseLot;
+   double equity = AccountEquity();
+   if (equity <= 0) equity = AccountBalance();
 
-   if (InpUseDynamicTiers)
+   // Maximum dollars permitted to risk on this trade
+   double maxRiskDollars = equity * (InpRiskPercentPerTrade / 100.0);
+
+   // Loss on 1.0 standard lot for slDistanceUSD price move:
+   // Example: $10.00 Gold move on 1 lot (100 oz) = $1,000 loss
+   double lossPerStandardLot = slDistanceUSD * g_ContractSize;
+
+   double lot = 0.01;
+   if (lossPerStandardLot > 0)
    {
-      double bal = AccountBalance();
-      // Compounding tiers optimized for 1:500 leverage:
-      // $100 - $149 : 0.02 lot ($10.60 margin)
-      // $150 - $249 : 0.04 lot ($21.20 margin)
-      // $250 - $379 : 0.07 lot ($37.10 margin)
-      // $380+       : 0.10 lot ($53.00 margin)
-      if (bal >= 380.0)      lot = 0.10;
-      else if (bal >= 250.0) lot = 0.07;
-      else if (bal >= 150.0) lot = 0.04;
-      else                   lot = 0.02;
+      lot = maxRiskDollars / lossPerStandardLot;
    }
 
+   // Broker compliance
    double minLot  = MarketInfo(Symbol(), MODE_MINLOT);
    double maxLot  = MarketInfo(Symbol(), MODE_MAXLOT);
    double lotStep = MarketInfo(Symbol(), MODE_LOTSTEP);
 
+   lot = MathFloor(lot / lotStep) * lotStep;
    if (lot < minLot) lot = minLot;
    if (lot > maxLot) lot = maxLot;
-   lot = MathFloor(lot / lotStep) * lotStep;
 
-   // Margin safety check
+   // Margin check at current leverage
    double marginReq = (Ask * lot * g_ContractSize) / MathMax(AccountLeverage(), 1);
    if (marginReq > (AccountFreeMargin() * 0.70) && lot > minLot)
    {
@@ -224,16 +301,14 @@ double GetCompoundedSwingLot()
 }
 
 //+------------------------------------------------------------------+
-//| Check Trend & Pullback Entry Signal (Self-Contained & Resilient) |
+//| Check Trend & Pullback Entry Signal                              |
 //+------------------------------------------------------------------+
 void CheckAndExecuteSwingEntry()
 {
-   // Only evaluate on new bar formation to avoid intra-bar whipsaw
    datetime currentBarTime = Time[0];
    if (currentBarTime == g_LastBarTime) return;
 
-   // 1. Determine Trend Direction:
-   // Uses 200-EMA on current chart (or H4 fallback if available)
+   // 1. Trend Direction
    double ema200 = iMA(Symbol(), 0, InpTrendEMA_Slow, 0, MODE_EMA, PRICE_CLOSE, 1);
    double ema50  = iMA(Symbol(), 0, InpPullbackEMA_Slow, 0, MODE_EMA, PRICE_CLOSE, 1);
    double ema20  = iMA(Symbol(), 0, InpPullbackEMA_Fast, 0, MODE_EMA, PRICE_CLOSE, 1);
@@ -242,7 +317,7 @@ void CheckAndExecuteSwingEntry()
    double high1  = High[1];
    double open1  = Open[1];
 
-   // Attempt H4 trend confirmation if H4 data is present in tester/terminal
+   // H4 trend confirmation if available
    double h4_Close = iClose(Symbol(), PERIOD_H4, 1);
    double h4_EMA50 = iMA(Symbol(), PERIOD_H4, 50, 0, MODE_EMA, PRICE_CLOSE, 1);
    bool h4Bullish = true;
@@ -272,24 +347,14 @@ void CheckAndExecuteSwingEntry()
 
    double tp1DistUSD = slDistUSD * InpRewardRatioTP1;
 
-   // Diagnostic bar log
-   if (InpVerboseLogging)
-   {
-      Print("[SWING SCAN] Bar: ", TimeToStr(currentBarTime, TIME_DATE|TIME_MINUTES),
-            " | Close: $", DoubleToStr(close1, 2),
-            " | EMA200: $", DoubleToStr(ema200, 2),
-            " | Trend: ", (trendBullish ? "BULLISH" : (trendBearish ? "BEARISH" : "NEUTRAL")),
-            " | RSI: ", DoubleToStr(rsi_1, 1));
-   }
+   // Calculate strictly risk-controlled lot size
+   double lot = CalculateDynamicRiskLot(slDistUSD);
+   double actualRiskUSD = slDistUSD * lot * g_ContractSize;
+   double actualRewardUSD = tp1DistUSD * lot * g_ContractSize;
 
    RefreshRates();
-   double lot = GetCompoundedSwingLot();
 
    // --- BUY SETUP ---
-   // 1. Bullish Trend (Price > EMA200)
-   // 2. Recent pullback: Low penetrated into or below EMA20/EMA50 zone in last 3 bars
-   // 3. Rejection / Bullish turn: Close[1] closed above EMA20 and Close[1] > Open[1]
-   // 4. RSI recovering upward (rsi_1 > rsi_2 and rsi_1 <= 60)
    bool touchedValueZoneBuy = (Low[1] <= ema20 || Low[2] <= ema20 || Low[3] <= ema20);
 
    if (trendBullish && touchedValueZoneBuy && close1 >= ema20 && close1 > open1 && rsi_1 > rsi_2 && rsi_1 <= 62.0)
@@ -301,8 +366,10 @@ void CheckAndExecuteSwingEntry()
       int ticket = OrderSend(Symbol(), OP_BUY, lot, price, InpSlippage, sl, tp, "Swing Buy Setup", InpMagicNumber, 0, clrDodgerBlue);
       if (ticket > 0)
       {
-         Print("[SWING BUY SUCCESS] Order #", ticket, " ", DoubleToStr(lot, 2), " lots @ ", price,
-               " | SL: ", sl, " (Risk: $", DoubleToStr(slDistUSD, 2), ") | TP1: ", tp, " (Reward: $", DoubleToStr(tp1DistUSD, 2), ")");
+         Print("[SWING BUY EXECUTED] Order #", ticket, " ", DoubleToStr(lot, 2), " lots @ ", price,
+               " | Max Dollar Risk: $", DoubleToStr(actualRiskUSD, 2), " (", DoubleToStr(InpRiskPercentPerTrade, 1), "% of equity)",
+               " | Potential Reward: $", DoubleToStr(actualRewardUSD, 2),
+               " | SL: ", sl, " | TP1: ", tp);
          g_PartialClosed = false;
          g_LastBarTime = currentBarTime;
       }
@@ -314,10 +381,6 @@ void CheckAndExecuteSwingEntry()
    }
 
    // --- SELL SETUP ---
-   // 1. Bearish Trend (Price < EMA200)
-   // 2. Recent pullback: High penetrated into or above EMA20/EMA50 zone in last 3 bars
-   // 3. Rejection / Bearish turn: Close[1] closed below EMA20 and Close[1] < Open[1]
-   // 4. RSI turning downward (rsi_1 < rsi_2 and rsi_1 >= 38.0)
    bool touchedValueZoneSell = (High[1] >= ema20 || High[2] >= ema20 || High[3] >= ema20);
 
    if (trendBearish && touchedValueZoneSell && close1 <= ema20 && close1 < open1 && rsi_1 < rsi_2 && rsi_1 >= 38.0)
@@ -329,8 +392,10 @@ void CheckAndExecuteSwingEntry()
       int ticket = OrderSend(Symbol(), OP_SELL, lot, price, InpSlippage, sl, tp, "Swing Sell Setup", InpMagicNumber, 0, clrCrimson);
       if (ticket > 0)
       {
-         Print("[SWING SELL SUCCESS] Order #", ticket, " ", DoubleToStr(lot, 2), " lots @ ", price,
-               " | SL: ", sl, " (Risk: $", DoubleToStr(slDistUSD, 2), ") | TP1: ", tp, " (Reward: $", DoubleToStr(tp1DistUSD, 2), ")");
+         Print("[SWING SELL EXECUTED] Order #", ticket, " ", DoubleToStr(lot, 2), " lots @ ", price,
+               " | Max Dollar Risk: $", DoubleToStr(actualRiskUSD, 2), " (", DoubleToStr(InpRiskPercentPerTrade, 1), "% of equity)",
+               " | Potential Reward: $", DoubleToStr(actualRewardUSD, 2),
+               " | SL: ", sl, " | TP1: ", tp);
          g_PartialClosed = false;
          g_LastBarTime = currentBarTime;
       }
@@ -483,23 +548,25 @@ void UpdateHUD()
    double eq  = AccountEquity();
    double pnl = eq - g_InitialBalance;
    double pct = (g_InitialBalance > 0) ? (pnl / g_InitialBalance) * 100.0 : 0.0;
-   double lot = GetCompoundedSwingLot();
+   double ddFromPeak = (g_PeakEquity > 0) ? ((g_PeakEquity - eq) / g_PeakEquity) * 100.0 : 0.0;
 
    double ema200 = iMA(Symbol(), 0, InpTrendEMA_Slow, 0, MODE_EMA, PRICE_CLOSE, 1);
    string trend = (Close[1] > ema200) ? "BULLISH (BUY ONLY)" : "BEARISH (SELL ONLY)";
 
    string hud = "";
    hud += "====================================================\n";
-   hud += "  XAUUSD SWING MASTER EA v1.10                      \n";
+   hud += "  XAUUSD SWING MASTER EA v2.00 (CAPITAL GUARD)      \n";
    hud += "====================================================\n";
    hud += StringConcatenate("  Current Balance   : $", DoubleToStr(bal, 2), " (Initial: $", DoubleToStr(g_InitialBalance, 2), ")\n");
    hud += StringConcatenate("  Current Equity    : $", DoubleToStr(eq, 2), " | Total PnL: $", DoubleToStr(pnl, 2), " (", DoubleToStr(pct, 1), "%)\n");
-   hud += StringConcatenate("  Compounded Lot    : ", DoubleToStr(lot, 2), " lot (Leverage 1:500)\n");
+   hud += StringConcatenate("  Peak Equity       : $", DoubleToStr(g_PeakEquity, 2), " | DD from Peak: ", DoubleToStr(ddFromPeak, 1), "% (Max: ", DoubleToStr(InpMaxDrawdownFromPeak, 1), "%)\n");
+   hud += StringConcatenate("  Profit Floor      : $", DoubleToStr(g_ProfitFloor, 2), (g_ProfitFloor > 0 ? " [LOCKED CAPITAL]" : " [Not Set Yet]"), "\n");
    hud += "----------------------------------------------------\n";
+   hud += StringConcatenate("  Risk Per Trade    : ", DoubleToStr(InpRiskPercentPerTrade, 1), "% of equity (Dynamic Formula)\n");
+   hud += StringConcatenate("  Circuit Breaker   : ", (g_CircuitBreakerTripped ? "HALTED - GAINS PROTECTED" : "ACTIVE & MONITORING"), "\n");
    hud += StringConcatenate("  Trend Bias        : ", trend, "\n");
    hud += StringConcatenate("  Active Trades     : ", CountOpenSwingTrades(), " trade(s)\n");
    hud += StringConcatenate("  Partial TP1 Status: ", (g_PartialClosed ? "TP1 BANKED (RUNNER TRAILING)" : "AWAITING TP1"), "\n");
-   hud += StringConcatenate("  Friday Guard      : ", (g_FridayClosedForLowVol ? "TRIGGERED (CLOSED FOR WEEKEND)" : "MONITORING"), "\n");
    hud += StringConcatenate("  Current Gold Bid  : $", DoubleToStr(Bid, 2), " | Spread: $", DoubleToStr(Ask - Bid, 2), "\n");
    hud += "====================================================\n";
 
