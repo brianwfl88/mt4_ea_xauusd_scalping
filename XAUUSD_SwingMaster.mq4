@@ -2,21 +2,30 @@
 //|                                         XAUUSD_SwingMaster.mq4   |
 //|               Institutional Trend & Volatility Swing Engine      |
 //|                    Engineered for Gold (XAUUSD) Swing Trading    |
-//|                    Version 2.00: Strict Capital Preservation     |
+//|                    Version 2.20: Safe Recovery & Restart Engine  |
 //+------------------------------------------------------------------+
 #property copyright "Quantitative Trading Engine"
 #property link      "https://github.com"
-#property version   "2.00"
+#property version   "2.20"
 #property strict
 
 //--- Inputs: Strict Capital Protection & Mathematical Risk Sizing
-input string   _Section1               = "=== Strict Capital Preservation & Risk ===";
-input double   InpRiskPercentPerTrade  = 4.0;      // Max Risk % per trade of current equity (3.0% - 5.0%)
+input string   _Section1               = "=== Capital Preservation & Risk ===";
+input double   InpRiskPercentPerTrade  = 4.0;      // Max Risk % per trade in Normal Mode (3.0% - 5.0%)
 input double   InpMaxDrawdownFromPeak  = 15.0;     // Max Drawdown % from Peak Equity before emergency halt
 input bool     InpEnableProfitRatchet  = true;     // Ratchet Profit Floor (Locks in gains at $200, $300, etc.)
 input double   InpRewardRatioTP1       = 2.0;      // Risk-to-Reward ratio for TP1 (1:2 R:R)
 input double   InpPartialClosePercent  = 50.0;     // Percentage of position to close at TP1 (50%)
 input double   InpBreakEvenBufferUSD   = 0.50;     // Profit locked when moving to Break-Even ($0.50)
+
+//--- Inputs: Safe Recovery & Restart Mode
+input string   _Section1b              = "=== Safe Recovery & Restart Mode ===";
+input bool     InpAutoResumeAfterHalt  = true;     // Automatically resume trading after cooldown
+input int      InpHaltCooldownHours    = 8;        // Cooldown hours before auto-resuming (e.g. 8 hours)
+input bool     InpEnableRecoveryMode   = true;     // Re-enter market in Safe Recovery Mode (Smallest lot first)
+input double   InpRecoveryTargetUSD    = 15.00;    // Profit needed ($) to graduate from Recovery to Normal Mode
+input double   InpRecoveryMinLot       = 0.01;     // Stage 1 Lot: Smallest lot size (0.01)
+input double   InpRecoveryStepLot      = 0.02;     // Stage 2 Lot: Stepped-up lot size (0.02)
 
 //--- Inputs: Trend & Pullback Logic
 input string   _Section2               = "=== Trend & Pullback Logic ===";
@@ -50,14 +59,20 @@ input int      InpSlippage             = 50;       // Max Slippage in Points
 input bool     InpVerboseLogging       = true;     // Verbose logging in Journal
 
 //--- Global Variables
-double g_ContractSize          = 100.0;
-double g_InitialBalance        = 0.0;
-double g_PeakEquity            = 0.0;
-double g_ProfitFloor           = 0.0;
-bool   g_PartialClosed         = false;
-bool   g_CircuitBreakerTripped = false;
-bool   g_FridayClosedForLowVol = false;
-datetime g_LastBarTime         = 0;
+double    g_ContractSize          = 100.0;
+double    g_InitialBalance        = 0.0;
+double    g_PeakEquity            = 0.0;
+double    g_ProfitFloor           = 0.0;
+bool      g_PartialClosed         = false;
+bool      g_CircuitBreakerTripped = false;
+bool      g_FridayClosedForLowVol = false;
+datetime  g_HaltTimestamp         = 0;
+bool      g_InRecoveryMode        = false;
+int       g_RecoveryStage         = 1;
+double    g_RecoveryStartEquity   = 0.0;
+datetime  g_LastBarTime           = 0;
+
+string    g_BtnName               = "btn_SwingResume";
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                   |
@@ -79,14 +94,20 @@ int OnInit()
    g_PartialClosed         = false;
    g_CircuitBreakerTripped = false;
    g_FridayClosedForLowVol = false;
+   g_HaltTimestamp         = 0;
+   g_InRecoveryMode        = false;
+   g_RecoveryStage         = 1;
+   g_RecoveryStartEquity   = g_InitialBalance;
    g_LastBarTime           = 0;
 
+   // Create on-chart interactive resume button
+   CreateResumeButton();
+
    Print("==================================================================");
-   Print("[INIT] XAUUSD Swing Master Engine v2.00 Initialized.");
-   Print("[INIT] Capital Protection Active | Starting Balance: $", DoubleToStr(g_InitialBalance, 2),
+   Print("[INIT] XAUUSD Swing Master Engine v2.20 Initialized.");
+   Print("[INIT] Safe Recovery & Restart Engine Ready | Starting Balance: $", DoubleToStr(g_InitialBalance, 2),
          " | Leverage: 1:", AccountLeverage(),
-         " | Contract Size: ", DoubleToStr(g_ContractSize, 0),
-         " | Risk Per Trade: ", DoubleToStr(InpRiskPercentPerTrade, 1), "%");
+         " | Contract Size: ", DoubleToStr(g_ContractSize, 0));
    Print("==================================================================");
 
    return(INIT_SUCCEEDED);
@@ -98,6 +119,7 @@ int OnInit()
 void OnDeinit(const int reason)
 {
    Comment("");
+   ObjectDelete(0, g_BtnName);
 }
 
 //+------------------------------------------------------------------+
@@ -105,36 +127,123 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 void OnTick()
 {
-   // 1. Maintain Peak Equity and Ratchet Profit Floors
-   MaintainCapitalProtection();
-
-   // 2. Check Circuit Breaker Status
+   // 1. Check Auto-Resume timer if halted
    if (g_CircuitBreakerTripped)
    {
-      UpdateHUD();
-      return;
+      CheckAutoResumeTimer();
    }
 
-   // 3. Friday Volatility & Weekend Risk Manager
+   // 2. Maintain Peak Equity and Ratchet Profit Floors
+   if (!g_CircuitBreakerTripped)
+   {
+      MaintainCapitalProtection();
+   }
+
+   // 3. Update HUD & Button status
+   UpdateHUD();
+
+   // 4. If halted, block execution until resumed
+   if (g_CircuitBreakerTripped) return;
+
+   // 5. Friday Volatility & Weekend Risk Manager
    if (InpEnableFridayFilter)
    {
       CheckFridayWeekendRisk();
    }
 
-   // 4. Manage Active Open Swing Positions (TP1 Partial Close, Break-Even, ATR Trail)
+   // 6. Manage Active Open Swing Positions (TP1 Partial Close, Break-Even, ATR Trail)
    ManageOpenSwingTrades();
 
-   // 5. Update On-Chart HUD
-   UpdateHUD();
-
-   // 6. Entry Guard Checks
+   // 7. Entry Guard Checks
    if (g_CircuitBreakerTripped) return;
    if (g_FridayClosedForLowVol) return;
    if (CountOpenSwingTrades() > 0) return; // Strictly 1 swing setup at a time
    if (!IsSpreadOk()) return;
 
-   // 7. Check Swing Entry Signal
+   // 8. Check Swing Entry Signal
    CheckAndExecuteSwingEntry();
+}
+
+//+------------------------------------------------------------------+
+//| OnChartEvent: Handle Button Click to Resume Trading              |
+//+------------------------------------------------------------------+
+void OnChartEvent(const int id, const long &lparam, const double &dparam, const string &sparam)
+{
+   if (id == CHARTEVENT_OBJECT_CLICK)
+   {
+      if (sparam == g_BtnName)
+      {
+         if (g_CircuitBreakerTripped)
+         {
+            Print("[MANUAL OVERRIDE] User clicked Resume Button on chart.");
+            ResumeTradingFromHalt();
+         }
+         else
+         {
+            Print("[BUTTON CLICKED] Trading is already active. Current Mode: ", (g_InRecoveryMode ? "RECOVERY" : "NORMAL"));
+         }
+         ObjectSetInteger(0, g_BtnName, OBJPROP_STATE, false);
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Trigger Circuit Breaker & Start Halt Cooldown                    |
+//+------------------------------------------------------------------+
+void TriggerHalt(string reason)
+{
+   CloseAllSwingPositions();
+   g_CircuitBreakerTripped = true;
+   g_HaltTimestamp         = TimeCurrent();
+   g_InRecoveryMode        = InpEnableRecoveryMode;
+   g_RecoveryStage         = 1;
+   g_RecoveryStartEquity   = AccountEquity();
+
+   Print("------------------------------------------------------------------");
+   Print("[CIRCUIT BREAKER HALT] ", reason);
+   Print("[HALT TIMED] Trading halted at: ", TimeToStr(g_HaltTimestamp, TIME_DATE|TIME_MINUTES),
+         " | Current Equity: $", DoubleToStr(AccountEquity(), 2),
+         " | Auto-Resume in: ", InpHaltCooldownHours, " hours (Safe Recovery Mode)");
+   Print("------------------------------------------------------------------");
+}
+
+//+------------------------------------------------------------------+
+//| Resume Trading from Halt and initialize Safe Recovery Mode       |
+//+------------------------------------------------------------------+
+void ResumeTradingFromHalt()
+{
+   g_CircuitBreakerTripped = false;
+   g_HaltTimestamp         = 0;
+   g_PeakEquity            = MathMax(AccountBalance(), AccountEquity());
+   g_ProfitFloor           = 0.0;
+   g_InRecoveryMode        = InpEnableRecoveryMode;
+   g_RecoveryStage         = 1;
+   g_RecoveryStartEquity   = AccountEquity();
+
+   Print("==================================================================");
+   Print("[RESUME TRADING] System woke up! Safe Recovery Mode: ACTIVE.");
+   Print("[RECOVERY MODE] Stage 1 initialized: Starting with smallest lot (", DoubleToStr(InpRecoveryMinLot, 2), " lot).");
+   Print("[RECOVERY GOAL] Gain +$", DoubleToStr(InpRecoveryTargetUSD, 2), " to safely restore normal dynamic risk sizing.");
+   Print("==================================================================");
+}
+
+//+------------------------------------------------------------------+
+//| Check if Cooldown Timer expired to auto-resume trading           |
+//+------------------------------------------------------------------+
+void CheckAutoResumeTimer()
+{
+   if (!InpAutoResumeAfterHalt) return;
+   if (g_HaltTimestamp <= 0) return;
+
+   datetime now = TimeCurrent();
+   int elapsedSec = int(now - g_HaltTimestamp);
+   int targetSec  = InpHaltCooldownHours * 3600;
+
+   if (elapsedSec >= targetSec)
+   {
+      Print("[AUTO-RESUME COOLDOWN EXPIRED] ", InpHaltCooldownHours, " hours have elapsed since halt. Automatically restarting in Safe Recovery Mode!");
+      ResumeTradingFromHalt();
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -148,10 +257,7 @@ void MaintainCapitalProtection()
       g_PeakEquity = curEquity;
 
       // Ratchet Profit Floor as capital scales:
-      // When equity hits $200, floor = $150 (locks in +$50 minimum)
-      // When equity hits $300, floor = $240 (locks in +$140 minimum)
-      // When equity hits $400, floor = $330 (locks in +$230 minimum)
-      if (InpEnableProfitRatchet)
+      if (InpEnableProfitRatchet && !g_InRecoveryMode)
       {
          if (g_PeakEquity >= 400.0)      g_ProfitFloor = MathMax(g_ProfitFloor, 330.0);
          else if (g_PeakEquity >= 300.0) g_ProfitFloor = MathMax(g_ProfitFloor, 240.0);
@@ -159,7 +265,7 @@ void MaintainCapitalProtection()
       }
    }
 
-   // 1. Check Maximum Drawdown from Peak Equity (e.g. max 15% drawdown from all-time peak)
+   // 1. Check Maximum Drawdown from Peak Equity
    double ddFromPeak = 0.0;
    if (g_PeakEquity > 0)
    {
@@ -168,29 +274,14 @@ void MaintainCapitalProtection()
 
    if (ddFromPeak >= InpMaxDrawdownFromPeak)
    {
-      if (!g_CircuitBreakerTripped)
-      {
-         Print("[CIRCUIT BREAKER ACTIVATED] Equity fell ", DoubleToStr(ddFromPeak, 1),
-               "% from peak of $", DoubleToStr(g_PeakEquity, 2),
-               ". Current Equity: $", DoubleToStr(curEquity, 2),
-               ". Closing all positions to lock in capital!");
-         CloseAllSwingPositions();
-         g_CircuitBreakerTripped = true;
-      }
+      TriggerHalt(StringConcatenate("Drawdown reached ", DoubleToStr(ddFromPeak, 1), "% from peak ($", DoubleToStr(g_PeakEquity, 2), ")"));
       return;
    }
 
    // 2. Check Profit Floor Ratchet Breach
-   if (InpEnableProfitRatchet && g_ProfitFloor > 0 && curEquity <= g_ProfitFloor)
+   if (InpEnableProfitRatchet && !g_InRecoveryMode && g_ProfitFloor > 0 && curEquity <= g_ProfitFloor)
    {
-      if (!g_CircuitBreakerTripped)
-      {
-         Print("[PROFIT FLOOR RATCHET TRIGGERED] Equity ($", DoubleToStr(curEquity, 2),
-               ") reached locked floor of $", DoubleToStr(g_ProfitFloor, 2),
-               ". Closing positions to preserve banked profits!");
-         CloseAllSwingPositions();
-         g_CircuitBreakerTripped = true;
-      }
+      TriggerHalt(StringConcatenate("Equity dropped to locked profit floor of $", DoubleToStr(g_ProfitFloor, 2)));
       return;
    }
 }
@@ -260,19 +351,44 @@ int CountOpenSwingTrades()
 }
 
 //+------------------------------------------------------------------+
-//| DYNAMIC RISK SIZING: Lot size mathematically tied to Stop Loss    |
-//| GUARANTEES that a losing trade NEVER exceeds InpRiskPercent      |
+//| DYNAMIC RISK SIZING WITH PROGRESSIVE RECOVERY GRADUATION         |
 //+------------------------------------------------------------------+
 double CalculateDynamicRiskLot(double slDistanceUSD)
 {
    double equity = AccountEquity();
    if (equity <= 0) equity = AccountBalance();
 
-   // Maximum dollars permitted to risk on this trade
-   double maxRiskDollars = equity * (InpRiskPercentPerTrade / 100.0);
+   // --- SAFE RECOVERY MODE LOGIC ---
+   if (g_InRecoveryMode)
+   {
+      double recoveryGain = equity - g_RecoveryStartEquity;
 
-   // Loss on 1.0 standard lot for slDistanceUSD price move:
-   // Example: $10.00 Gold move on 1 lot (100 oz) = $1,000 loss
+      // Graduation Condition: Reached target profit
+      if (recoveryGain >= InpRecoveryTargetUSD)
+      {
+         Print("==================================================================");
+         Print("[RECOVERY COMPLETE] Account gained +$", DoubleToStr(recoveryGain, 2),
+               " during recovery. Graduating to Normal Dynamic Risk Sizing!");
+         Print("==================================================================");
+         g_InRecoveryMode = false;
+         g_PeakEquity     = MathMax(g_PeakEquity, equity);
+      }
+      // Stage 2: Stepped-Up Lot (50% of recovery goal hit)
+      else if (recoveryGain >= (InpRecoveryTargetUSD * 0.50))
+      {
+         g_RecoveryStage = 2;
+         return InpRecoveryStepLot;
+      }
+      // Stage 1: Absolute Smallest Lot (0.01)
+      else
+      {
+         g_RecoveryStage = 1;
+         return InpRecoveryMinLot;
+      }
+   }
+
+   // --- NORMAL DYNAMIC RISK SIZING ---
+   double maxRiskDollars = equity * (InpRiskPercentPerTrade / 100.0);
    double lossPerStandardLot = slDistanceUSD * g_ContractSize;
 
    double lot = 0.01;
@@ -281,7 +397,6 @@ double CalculateDynamicRiskLot(double slDistanceUSD)
       lot = maxRiskDollars / lossPerStandardLot;
    }
 
-   // Broker compliance
    double minLot  = MarketInfo(Symbol(), MODE_MINLOT);
    double maxLot  = MarketInfo(Symbol(), MODE_MAXLOT);
    double lotStep = MarketInfo(Symbol(), MODE_LOTSTEP);
@@ -290,7 +405,7 @@ double CalculateDynamicRiskLot(double slDistanceUSD)
    if (lot < minLot) lot = minLot;
    if (lot > maxLot) lot = maxLot;
 
-   // Margin check at current leverage
+   // Margin check
    double marginReq = (Ask * lot * g_ContractSize) / MathMax(AccountLeverage(), 1);
    if (marginReq > (AccountFreeMargin() * 0.70) && lot > minLot)
    {
@@ -340,14 +455,13 @@ void CheckAndExecuteSwingEntry()
    if (atr <= 0) atr = 2.50;
    double slDistUSD = atr * InpATRFactorSL;
 
-   // Ensure SL satisfies broker minimum stop distance
    double minStopUSD = (MarketInfo(Symbol(), MODE_STOPLEVEL) * Point) + (10 * Point);
    if (slDistUSD < minStopUSD) slDistUSD = minStopUSD;
-   if (slDistUSD < 2.50) slDistUSD = 2.50; // Minimum $2.50 buffer on Gold
+   if (slDistUSD < 2.50) slDistUSD = 2.50;
 
    double tp1DistUSD = slDistUSD * InpRewardRatioTP1;
 
-   // Calculate strictly risk-controlled lot size
+   // Sizing: respects Safe Recovery Mode or Normal Mode
    double lot = CalculateDynamicRiskLot(slDistUSD);
    double actualRiskUSD = slDistUSD * lot * g_ContractSize;
    double actualRewardUSD = tp1DistUSD * lot * g_ContractSize;
@@ -363,11 +477,13 @@ void CheckAndExecuteSwingEntry()
       double sl    = NormalizeDouble(price - slDistUSD, Digits);
       double tp    = NormalizeDouble(price + tp1DistUSD, Digits);
 
-      int ticket = OrderSend(Symbol(), OP_BUY, lot, price, InpSlippage, sl, tp, "Swing Buy Setup", InpMagicNumber, 0, clrDodgerBlue);
+      string comment = g_InRecoveryMode ? StringConcatenate("Recov S", g_RecoveryStage, " Buy") : "Swing Buy Setup";
+      int ticket = OrderSend(Symbol(), OP_BUY, lot, price, InpSlippage, sl, tp, comment, InpMagicNumber, 0, clrDodgerBlue);
       if (ticket > 0)
       {
          Print("[SWING BUY EXECUTED] Order #", ticket, " ", DoubleToStr(lot, 2), " lots @ ", price,
-               " | Max Dollar Risk: $", DoubleToStr(actualRiskUSD, 2), " (", DoubleToStr(InpRiskPercentPerTrade, 1), "% of equity)",
+               " | Mode: ", (g_InRecoveryMode ? StringConcatenate("RECOVERY STAGE ", g_RecoveryStage) : "NORMAL DYNAMIC"),
+               " | Dollar Risk: $", DoubleToStr(actualRiskUSD, 2),
                " | Potential Reward: $", DoubleToStr(actualRewardUSD, 2),
                " | SL: ", sl, " | TP1: ", tp);
          g_PartialClosed = false;
@@ -389,11 +505,13 @@ void CheckAndExecuteSwingEntry()
       double sl    = NormalizeDouble(price + slDistUSD, Digits);
       double tp    = NormalizeDouble(price - tp1DistUSD, Digits);
 
-      int ticket = OrderSend(Symbol(), OP_SELL, lot, price, InpSlippage, sl, tp, "Swing Sell Setup", InpMagicNumber, 0, clrCrimson);
+      string comment = g_InRecoveryMode ? StringConcatenate("Recov S", g_RecoveryStage, " Sell") : "Swing Sell Setup";
+      int ticket = OrderSend(Symbol(), OP_SELL, lot, price, InpSlippage, sl, tp, comment, InpMagicNumber, 0, clrCrimson);
       if (ticket > 0)
       {
          Print("[SWING SELL EXECUTED] Order #", ticket, " ", DoubleToStr(lot, 2), " lots @ ", price,
-               " | Max Dollar Risk: $", DoubleToStr(actualRiskUSD, 2), " (", DoubleToStr(InpRiskPercentPerTrade, 1), "% of equity)",
+               " | Mode: ", (g_InRecoveryMode ? StringConcatenate("RECOVERY STAGE ", g_RecoveryStage) : "NORMAL DYNAMIC"),
+               " | Dollar Risk: $", DoubleToStr(actualRiskUSD, 2),
                " | Potential Reward: $", DoubleToStr(actualRewardUSD, 2),
                " | SL: ", sl, " | TP1: ", tp);
          g_PartialClosed = false;
@@ -460,7 +578,6 @@ void ManageOpenSwingTrades()
                   }
                   else
                   {
-                     // If lot cannot be split (e.g. 0.01 lot), move SL to Break-Even directly
                      double beSL = (OrderType() == OP_BUY) ? NormalizeDouble(openPrice + InpBreakEvenBufferUSD, Digits)
                                                            : NormalizeDouble(openPrice - InpBreakEvenBufferUSD, Digits);
                      OrderModify(ticket, openPrice, beSL, 0, 0, clrGreen);
@@ -540,7 +657,25 @@ int GetCurrentUtcHour()
 }
 
 //+------------------------------------------------------------------+
-//| On-Chart Heads-Up Dashboard Display                              |
+//| Interactive On-Chart Button Creation                             |
+//+------------------------------------------------------------------+
+void CreateResumeButton()
+{
+   if (ObjectFind(0, g_BtnName) < 0)
+   {
+      ObjectCreate(0, g_BtnName, OBJ_BUTTON, 0, 0, 0);
+      ObjectSetInteger(0, g_BtnName, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+      ObjectSetInteger(0, g_BtnName, OBJPROP_XDISTANCE, 20);
+      ObjectSetInteger(0, g_BtnName, OBJPROP_YDISTANCE, 260);
+      ObjectSetInteger(0, g_BtnName, OBJPROP_XSIZE, 340);
+      ObjectSetInteger(0, g_BtnName, OBJPROP_YSIZE, 30);
+      ObjectSetInteger(0, g_BtnName, OBJPROP_FONTSIZE, 10);
+      ObjectSetString(0, g_BtnName, OBJPROP_FONT, "Arial Bold");
+   }
+}
+
+//+------------------------------------------------------------------+
+//| On-Chart Heads-Up Dashboard Display & Button State               |
 //+------------------------------------------------------------------+
 void UpdateHUD()
 {
@@ -553,17 +688,51 @@ void UpdateHUD()
    double ema200 = iMA(Symbol(), 0, InpTrendEMA_Slow, 0, MODE_EMA, PRICE_CLOSE, 1);
    string trend = (Close[1] > ema200) ? "BULLISH (BUY ONLY)" : "BEARISH (SELL ONLY)";
 
+   // Mode and sizing description
+   string modeStr = "NORMAL DYNAMIC RISK";
+   if (g_InRecoveryMode)
+   {
+      double recovGain = eq - g_RecoveryStartEquity;
+      modeStr = StringConcatenate("SAFE RECOVERY STAGE ", g_RecoveryStage, " (Gain: $", DoubleToStr(recovGain, 2), " / $", DoubleToStr(InpRecoveryTargetUSD, 2), ")");
+   }
+
+   // Update Button label & color
+   CreateResumeButton();
+   if (g_CircuitBreakerTripped)
+   {
+      int elapsedSec = int(TimeCurrent() - g_HaltTimestamp);
+      int remainSec = MathMax(0, (InpHaltCooldownHours * 3600) - elapsedSec);
+      int remainHours = remainSec / 3600;
+      int remainMins  = (remainSec % 3600) / 60;
+
+      ObjectSetString(0, g_BtnName, OBJPROP_TEXT, ">> CLICK TO RESUME TRADING NOW <<");
+      ObjectSetInteger(0, g_BtnName, OBJPROP_BGCOLOR, clrOrangeRed);
+      ObjectSetInteger(0, g_BtnName, OBJPROP_COLOR, clrWhite);
+   }
+   else if (g_InRecoveryMode)
+   {
+      ObjectSetString(0, g_BtnName, OBJPROP_TEXT, StringConcatenate("RECOVERY MODE ACTIVE (Stage ", g_RecoveryStage, ")"));
+      ObjectSetInteger(0, g_BtnName, OBJPROP_BGCOLOR, clrGold);
+      ObjectSetInteger(0, g_BtnName, OBJPROP_COLOR, clrBlack);
+   }
+   else
+   {
+      ObjectSetString(0, g_BtnName, OBJPROP_TEXT, "ENGINE RUNNING NORMALLY (ACTIVE)");
+      ObjectSetInteger(0, g_BtnName, OBJPROP_BGCOLOR, clrSeaGreen);
+      ObjectSetInteger(0, g_BtnName, OBJPROP_COLOR, clrWhite);
+   }
+
    string hud = "";
    hud += "====================================================\n";
-   hud += "  XAUUSD SWING MASTER EA v2.00 (CAPITAL GUARD)      \n";
+   hud += "  XAUUSD SWING MASTER EA v2.20 (SAFE RECOVERY)      \n";
    hud += "====================================================\n";
    hud += StringConcatenate("  Current Balance   : $", DoubleToStr(bal, 2), " (Initial: $", DoubleToStr(g_InitialBalance, 2), ")\n");
    hud += StringConcatenate("  Current Equity    : $", DoubleToStr(eq, 2), " | Total PnL: $", DoubleToStr(pnl, 2), " (", DoubleToStr(pct, 1), "%)\n");
    hud += StringConcatenate("  Peak Equity       : $", DoubleToStr(g_PeakEquity, 2), " | DD from Peak: ", DoubleToStr(ddFromPeak, 1), "% (Max: ", DoubleToStr(InpMaxDrawdownFromPeak, 1), "%)\n");
    hud += StringConcatenate("  Profit Floor      : $", DoubleToStr(g_ProfitFloor, 2), (g_ProfitFloor > 0 ? " [LOCKED CAPITAL]" : " [Not Set Yet]"), "\n");
    hud += "----------------------------------------------------\n";
-   hud += StringConcatenate("  Risk Per Trade    : ", DoubleToStr(InpRiskPercentPerTrade, 1), "% of equity (Dynamic Formula)\n");
-   hud += StringConcatenate("  Circuit Breaker   : ", (g_CircuitBreakerTripped ? "HALTED - GAINS PROTECTED" : "ACTIVE & MONITORING"), "\n");
+   hud += StringConcatenate("  Engine Mode       : ", modeStr, "\n");
+   hud += StringConcatenate("  Circuit Breaker   : ", (g_CircuitBreakerTripped ? "HALTED (Cooldown / Waiting Override)" : "ACTIVE & MONITORING"), "\n");
    hud += StringConcatenate("  Trend Bias        : ", trend, "\n");
    hud += StringConcatenate("  Active Trades     : ", CountOpenSwingTrades(), " trade(s)\n");
    hud += StringConcatenate("  Partial TP1 Status: ", (g_PartialClosed ? "TP1 BANKED (RUNNER TRAILING)" : "AWAITING TP1"), "\n");
