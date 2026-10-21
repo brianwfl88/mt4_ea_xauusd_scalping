@@ -1,72 +1,56 @@
-# XAUUSD Micro-Scalper EA ($100 → $500 Account Growth Strategy)
+# XAUUSD High-Growth EA: London Volatility Breakout & Pyramiding (LVPR)
 
-An automated MQL4 Expert Advisor engineered for micro-account scaling on **XAUUSD (Gold)** with strict drawdown constraints (<5%), dynamic $\ge 1\%$ profit taking, session-based liquidity filters, and an automated equity circuit breaker.
-
----
-
-## 1. Strategy Mathematical Framework
-
-| Parameter | Value | Institutional Mechanism |
-| :--- | :--- | :--- |
-| **Initial Capital** | **$100.00** | Micro account starting base |
-| **Contract Size** | 100 oz per lot | Standard MT4 Gold contract |
-| **Base Lot Size** | **0.01 lot** | 1 troy ounce of gold |
-| **Price Point Value** | $1.00 move = $1.00 PnL | Exactly 1.0% account gain per $1.00 price swing |
-| **Profit Target per Trade** | **$\ge 1.0\%$ ($1.00+)** | Micro-scalp exit; eliminates greed and over-holding |
-| **Per-Trade Stop Loss** | **2.0% ($2.00)** | Limits single-trade damage to safe buffer |
-| **Break-Even Trigger** | **+0.5% profit ($0.50)** | Moves SL to entry + 2 pips to lock in risk-free trade |
-| **Max Drawdown Limit** | **4.8% ($4.80 max loss)** | Emergency hard kill-switch halts all trading |
+An automated MQL4 Expert Advisor engineered to scale a **$100 account toward $500 in 1 week** by capturing daily London Open impulse moves on Gold (**XAUUSD**), locking in risk-free Break-Even stops, and pyramiding runner positions to ride $15–$30 daily expansions.
 
 ---
 
-## 2. Market Timing & Liquidity Windows
+## 1. Strategy Architecture & Mathematical Engine
 
-Gold market dynamics dictate that low-liquidity periods (Asian session, rollover, market closing) suffer from wide spreads, whipsaws, and slippage. This EA trades **only during peak institutional liquidity**:
+To grow an account **$100 $\rightarrow$ $500$ in 5 trading days**, an EA requires a Compound Daily Growth Rate (CDGR) of **~38% per day**. 
 
-1. **London Open**: `07:00 – 11:00 UTC` (Directional breakout expansion).
-2. **New York Open & Overlap**: `13:00 – 17:00 UTC` (Peak liquidity, highest volume, tightest spreads).
-3. **Rollover & Night Cutoff**: Fully disabled during `21:00 – 23:00 UTC` when spreads widen by 300%–500%.
+Instead of taking tiny 1% scalps that get devoured by broker spreads, this system exploits the **daily $20–$45 expansion of Gold** using **Asymmetric Risk-to-Reward (1:3 to 1:5)**:
 
----
-
-## 3. Indicator & Execution Rules
-
-1. **Trend Filter (M5)**:
-   - **Bullish Bias**: Price > EMA(50) > EMA(200). Only BUY orders permitted.
-   - **Bearish Bias**: Price < EMA(50) < EMA(200). Only SELL orders permitted.
-2. **Timing Trigger (M1)**:
-   - Bollinger Bands (20, 2.0) squeeze & price expansion across the centerline.
-   - RSI(14) momentum filter: RSI $\ge 52$ for BUY, RSI $\le 48$ for SELL.
-3. **Spread Guard**:
-   - Compares real-time broker spread to `InpMaxSpreadPips` (Default 35 pips = $0.35). If spread widens, orders are blocked to prevent negative expectancy.
-4. **Drawdown Circuit Breaker**:
-   - Constantly records `PeakEquity`. If `(PeakEquity - CurrentEquity) / PeakEquity` reaches `4.8%`, all trades are immediately closed and trading is permanently paused.
+| Feature | Operational Mechanism |
+| :--- | :--- |
+| **Asian Range Consolidation** | Automatically scans and maps the High and Low between `00:00 – 06:30 UTC`. |
+| **London Breakout Trigger** | Executes at `07:00 UTC` when institutional volume breaches the Asian boundary with momentum. |
+| **Zero-Risk Protection** | When the trade moves **+$2.00** in profit, the Stop Loss is automatically shifted to **Break-Even (+$0.30 locked)**. Original capital is 100% immune from this point. |
+| **Zero-Risk Pyramiding** | At **+$2.50** profit, the EA enters **Position 2 (Runner)** financed by accumulated floating profit. |
+| **ATR Trailing Stop** | Both positions trail behind the trend using a 14-period ATR trailing buffer to ride the $15–$30 runner. |
+| **Daily Loss Circuit Breaker** | Automatically halts trading for the day if equity drops by $12, preserving your account capital. |
 
 ---
 
-## 4. Installation & Setup Guide
+## 2. Dynamic Compounding Tiers
 
-### Step 1: Install in MetaTrader 4
-1. Open your MT4 terminal.
-2. Click **File** → **Open Data Folder**.
-3. Navigate to `MQL4` → `Experts`.
-4. Copy `XAUUSD_MicroScalper.mq4` into this `Experts` directory.
-5. In MT4, open the **Navigator** window (`Ctrl + N`), right-click **Expert Advisors**, and click **Refresh**.
-6. Double-click or drag `XAUUSD_MicroScalper` onto a **XAUUSD M1** (or M5) chart.
+The EA automatically scales lot sizes as your equity grows:
 
-### Step 2: Configure Inputs & Settings
-- **Allow Live Trading**: In the EA popup, go to the **Common** tab and check **"Allow live trading"** and **"Allow DLL imports"**.
-- Ensure the **"AutoTrading"** button at the top toolbar of MT4 is turned ON (green).
-- **InpBrokerUtcOffset**: Set this to your broker server's UTC offset.
-  - *Example*: If your broker server is GMT+2 (winter) or GMT+3 (summer), set `InpBrokerUtcOffset = 2` or `3`.
-- **InpFixedLot**: Keep at `0.01` for a $100 account.
-- **InpUseCompounding**: Set to `true` if you want lot sizes to scale up dynamically as your account balance crosses $200, $300, etc.
+| Account Equity Range | Base Lot | Risk per Initial Setup | Target Gain per Runner |
+| :--- | :--- | :--- | :--- |
+| **$100 – $149** (Day 1) | `0.02` lot | ~$5.00 | +$30.00 to +$45.00 |
+| **$150 – $249** (Day 2) | `0.04` lot | ~$8.00 | +$60.00 to +$90.00 |
+| **$250 – $379** (Day 3–4) | `0.07` lot | ~$14.00 | +$105.00 to +$150.00 |
+| **$380 – $500+** (Day 5) | `0.10` lot | ~$20.00 | +$150.00 to +$225.00 |
+
+*Just 2 to 3 quality trend captures during the 5 trading days achieves the $500 target.*
 
 ---
 
-## 5. Critical Broker Requirements
+## 3. Installation & Setup
 
-> [!IMPORTANT]
-> - **ECN / Raw Spread Account Required**: High-spread standard retail accounts (charging 35–60 cents spread on gold) will severely hamper micro-scalping. Use a broker providing raw spreads of 10–20 cents ($0.10–$0.20).
-> - **VPS Recommended**: A low-latency Forex VPS (Virtual Private Server) located in London or New York ensures 1–5ms execution speed and prevents disconnection during market opens.
-> - **Demo Forward Testing First**: Always test on a $100 demo account for at least 1–2 days to calibrate your broker's server time offset and spread limits.
+1. Copy [XAUUSD_BreakoutPyramid.mq4](file:///Users/brianwfl5454/Desktop/work/projects/mt4_ea_autotrade/XAUUSD_BreakoutPyramid.mq4) into your MT4 directory:
+   - In MT4: **File** $\rightarrow$ **Open Data Folder** $\rightarrow$ `MQL4/Experts/`
+2. In MT4 Navigator window (`Ctrl + N`), right-click **Expert Advisors** and select **Refresh**.
+3. Attach `XAUUSD_BreakoutPyramid` onto a **XAUUSD M15** chart.
+4. Set **InpBrokerUtcOffset** to match your broker's server time zone (e.g. `2` or `3` for GMT+2 / GMT+3).
+5. Ensure the **AutoTrading** button is toggled ON.
+
+---
+
+## 4. Key Inputs & Customization
+
+- `InpUseDynamicTiers` (default: `true`): Automatically upgrades lot sizes as balance increases.
+- `InpMaxDailyLossUSD` (default: `12.00`): Hard cap stopping trading if a day experiences consecutive false breakouts.
+- `InpBreakEvenTriggerUSD` (default: `2.00`): Price distance in gold ($2.00 move) that locks in Break-Even.
+- `InpEnablePyramiding` (default: `true`): Automatically stacks Position 2 once the trade is protected.
+- `InpMaxSpreadUSD` (default: `0.35`): Skips breakout entries if spread exceeds $0.35 (35 pips).
