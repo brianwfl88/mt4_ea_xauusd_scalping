@@ -2,11 +2,11 @@
 //|                                         XAUUSD_SwingMaster.mq4   |
 //|               Institutional Trend & Volatility Swing Engine      |
 //|                    Engineered for Gold (XAUUSD) Swing Trading    |
-//|                    Version 2.40: MACD & S/R Confluence Engine    |
+//|                    Version 2.50: MACD & RSI Dual Confluence      |
 //+------------------------------------------------------------------+
 #property copyright "Quantitative Trading Engine"
 #property link      "https://github.com"
-#property version   "2.40"
+#property version   "2.50"
 #property strict
 
 //--- Inputs: Strict Capital Protection & Mathematical Risk Sizing
@@ -18,14 +18,18 @@ input double   InpRewardRatioTP1       = 2.0;      // Risk-to-Reward ratio for T
 input double   InpPartialClosePercent  = 50.0;     // Percentage of position to close at TP1 (50%)
 input double   InpBreakEvenBufferUSD   = 0.50;     // Profit locked when moving to Break-Even ($0.50)
 
-//--- Inputs: MACD & Key Support / Resistance Settings
-input string   _Section1b              = "=== MACD & Support/Resistance Confluence ===";
-input bool     InpEnableMACDReversals  = true;     // Enable S/R + MACD Reversals (Without MA filter)
-input bool     InpEnableMACDPullback   = true;     // Enable MACD Momentum Trend Pullbacks (With MA filter)
+//--- Inputs: MACD & RSI Dual Confluence Settings
+input string   _Section1b              = "=== MACD & RSI Dual Confluence Engine ===";
+input bool     InpEnableMACDReversals  = true;     // Enable S/R + MACD & RSI Reversals (Without MA filter)
+input bool     InpEnableMACDPullback   = true;     // Enable Trend Pullbacks with MACD & RSI Momentum
+input bool     InpRequireRSITrendSync  = true;     // Require RSI Slope & Zone confirmation on entries
 input int      InpMACDFast             = 12;       // MACD Fast EMA Period
 input int      InpMACDSlow             = 26;       // MACD Slow EMA Period
 input int      InpMACDSignal           = 9;        // MACD Signal SMA Period
 input double   InpMACDExtremeUSD       = 0.80;     // MACD Extreme threshold for high-confidence reversal
+input int      InpRSIPeriod            = 14;       // RSI Period
+input double   InpRSIOversoldBuy       = 44.0;     // RSI Oversold threshold for Support Reversals
+input double   InpRSIOverboughtSell    = 56.0;     // RSI Overbought threshold for Resistance Reversals
 input double   InpSRZoneBufferUSD      = 3.00;     // S/R proximity zone buffer in Gold $ ($3.00)
 
 //--- Inputs: Session Risk & Daily Gap Guard
@@ -53,7 +57,6 @@ input string   _Section2               = "=== Trend & Moving Averages ===";
 input int      InpTrendEMA_Slow        = 200;      // Primary Trend Filter EMA (e.g. 200 EMA)
 input int      InpPullbackEMA_Fast     = 20;       // Dynamic Support/Resistance Fast EMA (20)
 input int      InpPullbackEMA_Slow     = 50;       // Dynamic Support/Resistance Slow EMA (50)
-input int      InpRSIPeriod            = 14;       // RSI Period
 
 //--- Inputs: Dynamic Stop Loss & ATR Trailing Stop
 input string   _Section3               = "=== Stop Loss & ATR Trailing ===";
@@ -136,10 +139,11 @@ int OnInit()
    CreateResumeButton();
 
    Print("==================================================================");
-   Print("[INIT] XAUUSD Swing Master Engine v2.40 Initialized.");
-   Print("[INIT] MACD & S/R Confluence Engine: ACTIVE");
+   Print("[INIT] XAUUSD Swing Master Engine v2.50 Initialized.");
+   Print("[INIT] MACD & RSI Dual Confluence Engine: ACTIVE");
    Print("[INIT] PDH: $", DoubleToStr(g_PDH, 2), " | PDL: $", DoubleToStr(g_PDL, 2),
          " | Today High: $", DoubleToStr(g_TodayHigh, 2), " | Today Low: $", DoubleToStr(g_TodayLow, 2));
+   Print("[INIT] Daily Cash Liquidation at: ", InpDailyCloseHourUTC, ":", InpDailyCloseMinuteUTC, " UTC");
    Print("==================================================================");
 
    return(INIT_SUCCEEDED);
@@ -230,11 +234,9 @@ void CheckDailyReset()
 //+------------------------------------------------------------------+
 void UpdateSupportResistance()
 {
-   // Previous Day High & Low
    g_PDH = iHigh(Symbol(), PERIOD_D1, 1);
    g_PDL = iLow(Symbol(), PERIOD_D1, 1);
 
-   // Today's High and Low from current day bars
    datetime serverNow = TimeCurrent();
    int sYear  = TimeYear(serverNow);
    int sMonth = TimeMonth(serverNow);
@@ -574,7 +576,7 @@ double CalculateDynamicRiskLot(double slDistanceUSD)
 }
 
 //+------------------------------------------------------------------+
-//| Check Entry Signals: MACD Reversal (S/R) & MACD Trend Pullback   |
+//| Check Entry Signals: MACD & RSI Dual Confluence                  |
 //+------------------------------------------------------------------+
 void CheckAndExecuteSwingEntry()
 {
@@ -599,7 +601,11 @@ void CheckAndExecuteSwingEntry()
    double macdHist_1 = macdMain_1 - macdSig_1;
    double macdHist_2 = macdMain_2 - macdSig_2;
 
-   // 3. Dynamic ATR Stop Loss Calculation
+   // 3. RSI Calculations (Bar 1 and Bar 2)
+   double rsi_1 = iRSI(Symbol(), 0, InpRSIPeriod, PRICE_CLOSE, 1);
+   double rsi_2 = iRSI(Symbol(), 0, InpRSIPeriod, PRICE_CLOSE, 2);
+
+   // 4. Dynamic ATR Stop Loss Calculation
    double atr = iATR(Symbol(), 0, InpATRPeriod, 1);
    if (atr <= 0) atr = 2.50;
    double slDistUSD = atr * InpATRFactorSL;
@@ -614,8 +620,8 @@ void CheckAndExecuteSwingEntry()
    RefreshRates();
 
    // ====================================================================
-   // SETUP TYPE 1: HIGH-CONFIDENCE MACD REVERSAL AT KEY S/R
-   // (USER RULE 1 & 2: Entered WITHOUT regards to Moving Average)
+   // SETUP TYPE 1: HIGH-CONFIDENCE MACD & RSI REVERSAL AT KEY S/R
+   // (USER RULES: Entered WITHOUT regards to Moving Average)
    // ====================================================================
    if (InpEnableMACDReversals)
    {
@@ -630,19 +636,24 @@ void CheckAndExecuteSwingEntry()
       bool macdHighConfBuy = (macdHist_1 > macdHist_2) && 
                              ((macdMain_1 < -InpMACDExtremeUSD) || (macdHist_2 < 0 && macdHist_1 >= 0));
 
-      if (nearSupport && bullishRejectionAtSupport && macdHighConfBuy)
+      // RSI confirmation: Hooking up from oversold/low territory
+      bool rsiConfBuy = (rsi_1 > rsi_2) && (rsi_2 <= InpRSIOversoldBuy || rsi_1 <= 48.0);
+      if (!InpRequireRSITrendSync) rsiConfBuy = true;
+
+      if (nearSupport && bullishRejectionAtSupport && macdHighConfBuy && rsiConfBuy)
       {
          double price = Ask;
          double sl    = NormalizeDouble(price - slDistUSD, Digits);
          double tp    = NormalizeDouble(price + tp1DistUSD, Digits);
 
-         string comment = "MACD S/R Buy Reversal";
+         string comment = "MACD+RSI S/R Buy Rev";
          int ticket = OrderSend(Symbol(), OP_BUY, lot, price, InpSlippage, sl, tp, comment, InpMagicNumber, 0, clrDodgerBlue);
          if (ticket > 0)
          {
-            Print("[MACD REVERSAL BUY] Order #", ticket, " ", DoubleToStr(lot, 2), " lots @ ", price,
-                  " | Reason: High-Confidence S/R Reversal at Support ($", DoubleToStr(g_PDL, 2), " / $", DoubleToStr(g_TodayLow, 2), ")",
+            Print("[MACD+RSI REVERSAL BUY] Order #", ticket, " ", DoubleToStr(lot, 2), " lots @ ", price,
+                  " | Reason: S/R Support Reversal ($", DoubleToStr(g_PDL, 2), " / $", DoubleToStr(g_TodayLow, 2), ")",
                   " | MACD Hist: ", DoubleToStr(macdHist_1, 3), " > ", DoubleToStr(macdHist_2, 3),
+                  " | RSI: ", DoubleToStr(rsi_1, 1), " (Slope +)",
                   " | SL: ", sl, " | TP1: ", tp);
             g_PartialClosed = false;
             g_LastBarTime = currentBarTime;
@@ -661,19 +672,24 @@ void CheckAndExecuteSwingEntry()
       bool macdHighConfSell = (macdHist_1 < macdHist_2) && 
                               ((macdMain_1 > InpMACDExtremeUSD) || (macdHist_2 > 0 && macdHist_1 <= 0));
 
-      if (nearResistance && bearishRejectionAtResistance && macdHighConfSell)
+      // RSI confirmation: Hooking down from overbought/high territory
+      bool rsiConfSell = (rsi_1 < rsi_2) && (rsi_2 >= InpRSIOverboughtSell || rsi_1 >= 52.0);
+      if (!InpRequireRSITrendSync) rsiConfSell = true;
+
+      if (nearResistance && bearishRejectionAtResistance && macdHighConfSell && rsiConfSell)
       {
          double price = Bid;
          double sl    = NormalizeDouble(price + slDistUSD, Digits);
          double tp    = NormalizeDouble(price - tp1DistUSD, Digits);
 
-         string comment = "MACD S/R Sell Reversal";
+         string comment = "MACD+RSI S/R Sell Rev";
          int ticket = OrderSend(Symbol(), OP_SELL, lot, price, InpSlippage, sl, tp, comment, InpMagicNumber, 0, clrCrimson);
          if (ticket > 0)
          {
-            Print("[MACD REVERSAL SELL] Order #", ticket, " ", DoubleToStr(lot, 2), " lots @ ", price,
-                  " | Reason: High-Confidence S/R Reversal at Resistance ($", DoubleToStr(g_PDH, 2), " / $", DoubleToStr(g_TodayHigh, 2), ")",
+            Print("[MACD+RSI REVERSAL SELL] Order #", ticket, " ", DoubleToStr(lot, 2), " lots @ ", price,
+                  " | Reason: S/R Resistance Reversal ($", DoubleToStr(g_PDH, 2), " / $", DoubleToStr(g_TodayHigh, 2), ")",
                   " | MACD Hist: ", DoubleToStr(macdHist_1, 3), " < ", DoubleToStr(macdHist_2, 3),
+                  " | RSI: ", DoubleToStr(rsi_1, 1), " (Slope -)",
                   " | SL: ", sl, " | TP1: ", tp);
             g_PartialClosed = false;
             g_LastBarTime = currentBarTime;
@@ -683,32 +699,39 @@ void CheckAndExecuteSwingEntry()
    }
 
    // ====================================================================
-   // SETUP TYPE 2: MACD MOMENTUM GAINING + MOVING AVERAGE PULLBACK
-   // (USER RULE 3: Trend Pullback into MA with Gaining MACD Momentum)
+   // SETUP TYPE 2: MACD & RSI MOMENTUM + MOVING AVERAGE PULLBACK
+   // (USER RULES: Trend Pullback into MA confirmed by MACD & RSI)
    // ====================================================================
    if (InpEnableMACDPullback)
    {
       bool trendBullish = (close1 > ema200 && ema50 > ema200);
       bool trendBearish = (close1 < ema200 && ema50 < ema200);
 
-      // A) BUY PULLBACK: Price pulled back to EMA 20/50 zone + MACD Gaining Bullish Momentum
+      // A) BUY PULLBACK: Price pulled back to EMA 20/50 zone + MACD & RSI Expanding Momentum
       bool touchedValueZoneBuy = (Low[1] <= ema20 || Low[2] <= ema20 || Low[3] <= ema20);
       bool priceRejectedZoneBuy = (close1 >= ema20 && close1 > open1);
+      
+      // MACD expanding momentum
       bool macdGainingBullish = (macdMain_1 > macdSig_1) && (macdHist_1 > macdHist_2 && macdHist_1 > 0);
+      
+      // RSI confirming trend resumption (above 45, hooking up, not overbought)
+      bool rsiBullishResumption = (rsi_1 > rsi_2) && (rsi_1 >= 45.0 && rsi_1 <= 64.0);
+      if (!InpRequireRSITrendSync) rsiBullishResumption = true;
 
-      if (trendBullish && touchedValueZoneBuy && priceRejectedZoneBuy && macdGainingBullish)
+      if (trendBullish && touchedValueZoneBuy && priceRejectedZoneBuy && macdGainingBullish && rsiBullishResumption)
       {
          double price = Ask;
          double sl    = NormalizeDouble(price - slDistUSD, Digits);
          double tp    = NormalizeDouble(price + tp1DistUSD, Digits);
 
-         string comment = "MACD MA Pullback Buy";
+         string comment = "MACD+RSI MA Pullback Buy";
          int ticket = OrderSend(Symbol(), OP_BUY, lot, price, InpSlippage, sl, tp, comment, InpMagicNumber, 0, clrDodgerBlue);
          if (ticket > 0)
          {
-            Print("[MACD PULLBACK BUY] Order #", ticket, " ", DoubleToStr(lot, 2), " lots @ ", price,
-                  " | Reason: Gaining Bullish MACD Momentum + MA Pullback",
+            Print("[MACD+RSI PULLBACK BUY] Order #", ticket, " ", DoubleToStr(lot, 2), " lots @ ", price,
+                  " | Reason: Bullish Trend Resumption with MACD & RSI Confluence",
                   " | MACD Hist: ", DoubleToStr(macdHist_1, 3), " > ", DoubleToStr(macdHist_2, 3),
+                  " | RSI: ", DoubleToStr(rsi_1, 1), " (Bullish Momentum)",
                   " | SL: ", sl, " | TP1: ", tp);
             g_PartialClosed = false;
             g_LastBarTime = currentBarTime;
@@ -716,24 +739,31 @@ void CheckAndExecuteSwingEntry()
          }
       }
 
-      // B) SELL PULLBACK: Price pulled back to EMA 20/50 zone + MACD Gaining Bearish Momentum
+      // B) SELL PULLBACK: Price pulled back to EMA 20/50 zone + MACD & RSI Expanding Momentum
       bool touchedValueZoneSell = (High[1] >= ema20 || High[2] >= ema20 || High[3] >= ema20);
       bool priceRejectedZoneSell = (close1 <= ema20 && close1 < open1);
+      
+      // MACD expanding momentum
       bool macdGainingBearish = (macdMain_1 < macdSig_1) && (macdHist_1 < macdHist_2 && macdHist_1 < 0);
+      
+      // RSI confirming trend resumption (below 55, hooking down, not oversold)
+      bool rsiBearishResumption = (rsi_1 < rsi_2) && (rsi_1 <= 55.0 && rsi_1 >= 36.0);
+      if (!InpRequireRSITrendSync) rsiBearishResumption = true;
 
-      if (trendBearish && touchedValueZoneSell && priceRejectedZoneSell && macdGainingBearish)
+      if (trendBearish && touchedValueZoneSell && priceRejectedZoneSell && macdGainingBearish && rsiBearishResumption)
       {
          double price = Bid;
          double sl    = NormalizeDouble(price + slDistUSD, Digits);
          double tp    = NormalizeDouble(price - tp1DistUSD, Digits);
 
-         string comment = "MACD MA Pullback Sell";
+         string comment = "MACD+RSI MA Pullback Sell";
          int ticket = OrderSend(Symbol(), OP_SELL, lot, price, InpSlippage, sl, tp, comment, InpMagicNumber, 0, clrCrimson);
          if (ticket > 0)
          {
-            Print("[MACD PULLBACK SELL] Order #", ticket, " ", DoubleToStr(lot, 2), " lots @ ", price,
-                  " | Reason: Gaining Bearish MACD Momentum + MA Pullback",
+            Print("[MACD+RSI PULLBACK SELL] Order #", ticket, " ", DoubleToStr(lot, 2), " lots @ ", price,
+                  " | Reason: Bearish Trend Resumption with MACD & RSI Confluence",
                   " | MACD Hist: ", DoubleToStr(macdHist_1, 3), " < ", DoubleToStr(macdHist_2, 3),
+                  " | RSI: ", DoubleToStr(rsi_1, 1), " (Bearish Momentum)",
                   " | SL: ", sl, " | TP1: ", tp);
             g_PartialClosed = false;
             g_LastBarTime = currentBarTime;
@@ -911,6 +941,9 @@ void UpdateHUD()
    double macdH = macdM - macdS;
    string macdDesc = (macdH > 0) ? "Expanding Bullish" : "Expanding Bearish";
 
+   double rsiVal = iRSI(Symbol(), 0, InpRSIPeriod, PRICE_CLOSE, 1);
+   string rsiDesc = (rsiVal >= 50.0) ? "Bullish Territory" : "Bearish Territory";
+
    string sessionPhase = GetCurrentSessionPhase();
 
    // Update Button label & color
@@ -942,7 +975,7 @@ void UpdateHUD()
 
    string hud = "";
    hud += "====================================================\n";
-   hud += "  XAUUSD SWING MASTER EA v2.40 (MACD & S/R ENGINE)  \n";
+   hud += "  XAUUSD SWING MASTER EA v2.50 (MACD & RSI DUAL)    \n";
    hud += "====================================================\n";
    hud += StringConcatenate("  Current Balance   : $", DoubleToStr(bal, 2), " (Initial: $", DoubleToStr(g_InitialBalance, 2), ")\n");
    hud += StringConcatenate("  Current Equity    : $", DoubleToStr(eq, 2), " | Total PnL: $", DoubleToStr(pnl, 2), " (", DoubleToStr(pct, 1), "%)\n");
@@ -952,6 +985,7 @@ void UpdateHUD()
    hud += StringConcatenate("  Key S/R Levels    : PDH: $", DoubleToStr(g_PDH, 2), " | PDL: $", DoubleToStr(g_PDL, 2), "\n");
    hud += StringConcatenate("  Today Extremes    : High: $", DoubleToStr(g_TodayHigh, 2), " | Low: $", DoubleToStr(g_TodayLow, 2), "\n");
    hud += StringConcatenate("  MACD Momentum     : Hist: ", DoubleToStr(macdH, 3), " (", macdDesc, ")\n");
+   hud += StringConcatenate("  RSI Indicator     : ", DoubleToStr(rsiVal, 1), " (", rsiDesc, ")\n");
    hud += StringConcatenate("  Session Phase     : ", sessionPhase, "\n");
    hud += StringConcatenate("  New Orders Allowed: ", (IsOrderPlacementAllowed() ? "YES" : "NO (Outside Window)"), "\n");
    hud += StringConcatenate("  Active Trades     : ", CountOpenSwingTrades(), " trade(s)\n");
