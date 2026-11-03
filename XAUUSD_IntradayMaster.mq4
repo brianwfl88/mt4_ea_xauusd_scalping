@@ -2,12 +2,12 @@
 //|                                       XAUUSD_IntradayMaster.mq4  |
 //|               Institutional Intraday Liquidity & FVG Engine      |
 //|                    Engineered for Gold (XAUUSD) on M15 Chart     |
-//|                    Version 2.00: Dual RSI + Cooldown + Max Trades|
+//|                    Version 2.10: Trend Sweeps + Early BE + DD Reset|
 //|                    Zero Overnight Risk | 1:500 Leverage Ready    |
 //+------------------------------------------------------------------+
 #property copyright "Quantitative Trading Engine"
 #property link      "https://github.com"
-#property version   "2.00"
+#property version   "2.10"
 #property strict
 
 //--- Inputs: Capital Preservation & Mathematical Risk Sizing
@@ -17,6 +17,7 @@ input double   InpMaxDrawdownFromPeak  = 15.0;     // Max Drawdown % from Peak E
 input bool     InpEnableProfitRatchet  = true;     // Ratchet Profit Floor (Locks in gains at $200, $300, etc.)
 input double   InpRewardRatioTP1       = 2.0;      // Risk-to-Reward ratio for TP1 (1:2 R:R)
 input double   InpPartialClosePercent  = 50.0;     // Percentage of position to close at TP1 (50%)
+input double   InpEarlyBETriggerATR    = 1.0;      // Profit in ATR multiples to move SL to Break-Even (1.0 = +1.0x ATR)
 input double   InpBreakEvenBufferUSD   = 0.40;     // Profit locked when moving to Break-Even ($0.40)
 input int      InpMaxDailyTrades       = 2;        // Max trades allowed per day (Prevents churn in choppy range)
 input int      InpCooldownMinutesAfterSL= 45;      // Cooldown minutes after a Stop Loss hit (0 = disabled)
@@ -47,6 +48,7 @@ input double   InpRecoveryStepLot      = 0.02;     // Stage 2 Lot: Stepped-up lo
 //--- Inputs: Intraday Setups & Technical Indicators
 input string   _Section4               = "=== Setups & Indicator Parameters ===";
 input bool     InpEnableSweepReversals = true;     // Enable Setup A: Asian Liquidity Sweeps
+input bool     InpFilterSweepsByTrend  = true;     // Filter Sweeps with 200 EMA (Only Buy dips in uptrend, Sell rallies in downtrend)
 input bool     InpEnableFVGRetest      = true;     // Enable Setup B: Momentum Break & FVG Retest
 input bool     InpRequireRSIFilter     = true;     // Require RSI confirmation on all entries
 input int      InpRSIPeriod            = 14;       // RSI Period (14)
@@ -144,8 +146,11 @@ int OnInit()
    CreateResumeButton();
 
    Print("==================================================================");
-   Print("[INIT] XAUUSD Intraday Master Engine v2.00 Initialized (M15).");
-   Print("[INIT] Max Daily Trades: ", InpMaxDailyTrades, " | SL Cooldown: ", InpCooldownMinutesAfterSL, "m | RSI Filter: ", (InpRequireRSIFilter ? "ACTIVE" : "OFF"));
+   Print("[INIT] XAUUSD Intraday Master Engine v2.10 Initialized (M15).");
+   Print("[INIT] Max Daily Trades: ", InpMaxDailyTrades, " | SL Cooldown: ", InpCooldownMinutesAfterSL,
+         "m | RSI Filter: ", (InpRequireRSIFilter ? "ACTIVE" : "OFF"),
+         " | Trend Sweep Filter: ", (InpFilterSweepsByTrend ? "ACTIVE" : "OFF"),
+         " | Early BE Lock: +", DoubleToStr(InpEarlyBETriggerATR, 1), "x ATR");
    Print("[INIT] Asian High: $", DoubleToStr(g_AsianHigh, 2), " | Asian Low: $", DoubleToStr(g_AsianLow, 2),
          " | PDH: $", DoubleToStr(g_PDH, 2), " | PDL: $", DoubleToStr(g_PDL, 2));
    Print("[INIT] Daily Cash Liquidation at: ", InpDailyCloseHourUTC, ":", InpDailyCloseMinuteUTC, " UTC");
@@ -456,6 +461,24 @@ void MaintainCapitalProtection()
       }
    }
 
+   // When in Recovery Mode, measure drawdown against recovery start equity (not historical peak)
+   // to eliminate the continuous halt-death-spiral loop.
+   if (g_InRecoveryMode)
+   {
+      if (g_RecoveryStartEquity > 0)
+      {
+         double recoveryDD = ((g_RecoveryStartEquity - curEquity) / g_RecoveryStartEquity) * 100.0;
+         if (recoveryDD >= InpMaxDrawdownFromPeak)
+         {
+            TriggerHalt(StringConcatenate("Drawdown in Recovery reached ", DoubleToStr(recoveryDD, 1),
+                                          "% from recovery baseline ($", DoubleToStr(g_RecoveryStartEquity, 2), ")"));
+            return;
+         }
+      }
+      return; // Do not check lifetime peak or profit floor while in recovery mode
+   }
+
+   // Normal Mode Drawdown & Profit Floor checks
    double ddFromPeak = 0.0;
    if (g_PeakEquity > 0)
    {
@@ -468,7 +491,7 @@ void MaintainCapitalProtection()
       return;
    }
 
-   if (InpEnableProfitRatchet && !g_InRecoveryMode && g_ProfitFloor > 0 && curEquity <= g_ProfitFloor)
+   if (InpEnableProfitRatchet && g_ProfitFloor > 0 && curEquity <= g_ProfitFloor)
    {
       TriggerHalt(StringConcatenate("Equity dropped to locked profit floor of $", DoubleToStr(g_ProfitFloor, 2)));
       return;
@@ -659,6 +682,10 @@ void CheckAndExecuteIntradayEntry()
    // ====================================================================
    if (InpEnableSweepReversals && g_AsianBoxFormed)
    {
+      // Trend bias alignment: Bullish sweeps prefer uptrend (Close > EMA200), Bearish sweeps prefer downtrend (Close < EMA200)
+      bool trendBullishSweep = (!InpFilterSweepsByTrend) || (close1 > ema200);
+      bool trendBearishSweep = (!InpFilterSweepsByTrend) || (close1 < ema200);
+
       // BUY SETUP: Price swept below Asian Low (or PDL) and closed back above with lower wick rejection
       bool sweptLow = (low1 < g_AsianLow || low1 < g_PDL);
       bool closedAboveSweep = (close1 > g_AsianLow) && (close1 > open1);
@@ -666,7 +693,7 @@ void CheckAndExecuteIntradayEntry()
       bool macdTurningBullish = (macdHist_1 > macdHist_2);
       bool rsiSweepBuyOk = (!InpRequireRSIFilter) || ((rsi_1 > rsi_2) && (rsi_2 <= InpRSIOversoldBuy || rsi_1 <= 48.0));
 
-      if (sweptLow && closedAboveSweep && lowerWickRejection && macdTurningBullish && rsiSweepBuyOk)
+      if (trendBullishSweep && sweptLow && closedAboveSweep && lowerWickRejection && macdTurningBullish && rsiSweepBuyOk)
       {
          double price = Ask;
          // Place SL right below the sweep wick tip with adequate buffer
@@ -683,7 +710,7 @@ void CheckAndExecuteIntradayEntry()
          {
             g_DailyTradesCount++;
             Print("[SWEEP BUY EXECUTED] Order #", ticket, " ", DoubleToStr(lot, 2), " lots @ ", price,
-                  " | Reason: Asian/PDL Liquidity Sweep Reversal",
+                  " | Reason: Asian/PDL Liquidity Sweep Reversal with Trend Alignment",
                   " | Asian Low: $", DoubleToStr(g_AsianLow, 2), " | Sweep Low: $", DoubleToStr(low1, 2),
                   " | RSI: ", DoubleToStr(rsi_1, 1), " (Slope +)",
                   " | Daily Trade #", g_DailyTradesCount, " of ", InpMaxDailyTrades,
@@ -701,7 +728,7 @@ void CheckAndExecuteIntradayEntry()
       bool macdTurningBearish = (macdHist_1 < macdHist_2);
       bool rsiSweepSellOk = (!InpRequireRSIFilter) || ((rsi_1 < rsi_2) && (rsi_2 >= InpRSIOverboughtSell || rsi_1 >= 52.0));
 
-      if (sweptHigh && closedBelowSweep && upperWickRejection && macdTurningBearish && rsiSweepSellOk)
+      if (trendBearishSweep && sweptHigh && closedBelowSweep && upperWickRejection && macdTurningBearish && rsiSweepSellOk)
       {
          double price = Bid;
          // Place SL right above the sweep wick tip with adequate buffer
@@ -718,7 +745,7 @@ void CheckAndExecuteIntradayEntry()
          {
             g_DailyTradesCount++;
             Print("[SWEEP SELL EXECUTED] Order #", ticket, " ", DoubleToStr(lot, 2), " lots @ ", price,
-                  " | Reason: Asian/PDH Liquidity Sweep Reversal",
+                  " | Reason: Asian/PDH Liquidity Sweep Reversal with Trend Alignment",
                   " | Asian High: $", DoubleToStr(g_AsianHigh, 2), " | Sweep High: $", DoubleToStr(high1, 2),
                   " | RSI: ", DoubleToStr(rsi_1, 1), " (Slope -)",
                   " | Daily Trade #", g_DailyTradesCount, " of ", InpMaxDailyTrades,
@@ -823,7 +850,43 @@ void ManageOpenIntradayTrades()
             double takeProfit= OrderTakeProfit();
             double curPrice  = (OrderType() == OP_BUY) ? Bid : Ask;
 
-            // 1. Partial Close at TP1 and Move SL to Break-Even
+            // 1. Early Break-Even Lock: When price reaches +1.0x ATR in profit, protect capital
+            if (InpEarlyBETriggerATR > 0)
+            {
+               double beTriggerDist = atr * InpEarlyBETriggerATR;
+               if (OrderType() == OP_BUY)
+               {
+                  if ((curPrice - openPrice) >= beTriggerDist)
+                  {
+                     double beSL = NormalizeDouble(openPrice + InpBreakEvenBufferUSD, Digits);
+                     if (stopLoss < beSL)
+                     {
+                        OrderModify(ticket, openPrice, beSL, takeProfit, 0, clrGreen);
+                        Print("[EARLY BREAK-EVEN LOCK] BUY #", ticket, " reached +", DoubleToStr(InpEarlyBETriggerATR, 1),
+                              "x ATR profit (+$", DoubleToStr(curPrice - openPrice, 2), "). SL locked to +$",
+                              DoubleToStr(InpBreakEvenBufferUSD, 2), " (", beSL, ")");
+                        stopLoss = beSL;
+                     }
+                  }
+               }
+               else if (OrderType() == OP_SELL)
+               {
+                  if ((openPrice - curPrice) >= beTriggerDist)
+                  {
+                     double beSL = NormalizeDouble(openPrice - InpBreakEvenBufferUSD, Digits);
+                     if (stopLoss > beSL || stopLoss == 0)
+                     {
+                        OrderModify(ticket, openPrice, beSL, takeProfit, 0, clrGreen);
+                        Print("[EARLY BREAK-EVEN LOCK] SELL #", ticket, " reached +", DoubleToStr(InpEarlyBETriggerATR, 1),
+                              "x ATR profit (+$", DoubleToStr(openPrice - curPrice, 2), "). SL locked to +$",
+                              DoubleToStr(InpBreakEvenBufferUSD, 2), " (", beSL, ")");
+                        stopLoss = beSL;
+                     }
+                  }
+               }
+            }
+
+            // 2. Partial Close at TP1 and Move SL to Break-Even
             if (takeProfit > 0)
             {
                bool tpReached = (OrderType() == OP_BUY) ? (curPrice >= takeProfit) : (curPrice <= takeProfit);
