@@ -2,21 +2,24 @@
 //|                                       XAUUSD_IntradayMaster.mq4  |
 //|               Institutional Intraday Liquidity & FVG Engine      |
 //|                    Engineered for Gold (XAUUSD) on M15 Chart     |
+//|                    Version 2.00: Dual RSI + Cooldown + Max Trades|
 //|                    Zero Overnight Risk | 1:500 Leverage Ready    |
 //+------------------------------------------------------------------+
 #property copyright "Quantitative Trading Engine"
 #property link      "https://github.com"
-#property version   "1.00"
+#property version   "2.00"
 #property strict
 
 //--- Inputs: Capital Preservation & Mathematical Risk Sizing
 input string   _Section1               = "=== Capital Preservation & Risk ===";
-input double   InpRiskPercentPerTrade  = 3.5;      // Max Risk % per trade in London Prime (3.0% - 4.0%)
+input double   InpRiskPercentPerTrade  = 2.5;      // Max Risk % per trade in London Prime (2.0% - 3.5%)
 input double   InpMaxDrawdownFromPeak  = 15.0;     // Max Drawdown % from Peak Equity before emergency halt
 input bool     InpEnableProfitRatchet  = true;     // Ratchet Profit Floor (Locks in gains at $200, $300, etc.)
 input double   InpRewardRatioTP1       = 2.0;      // Risk-to-Reward ratio for TP1 (1:2 R:R)
 input double   InpPartialClosePercent  = 50.0;     // Percentage of position to close at TP1 (50%)
 input double   InpBreakEvenBufferUSD   = 0.40;     // Profit locked when moving to Break-Even ($0.40)
+input int      InpMaxDailyTrades       = 2;        // Max trades allowed per day (Prevents churn in choppy range)
+input int      InpCooldownMinutesAfterSL= 45;      // Cooldown minutes after a Stop Loss hit (0 = disabled)
 
 //--- Inputs: Session Clock & Daily Gap Guard
 input string   _Section2               = "=== Session Clock & Daily Gap Guard ===";
@@ -45,6 +48,10 @@ input double   InpRecoveryStepLot      = 0.02;     // Stage 2 Lot: Stepped-up lo
 input string   _Section4               = "=== Setups & Indicator Parameters ===";
 input bool     InpEnableSweepReversals = true;     // Enable Setup A: Asian Liquidity Sweeps
 input bool     InpEnableFVGRetest      = true;     // Enable Setup B: Momentum Break & FVG Retest
+input bool     InpRequireRSIFilter     = true;     // Require RSI confirmation on all entries
+input int      InpRSIPeriod            = 14;       // RSI Period (14)
+input double   InpRSIOversoldBuy       = 42.0;     // RSI Oversold threshold for Sweep Buys
+input double   InpRSIOverboughtSell    = 58.0;     // RSI Overbought threshold for Sweep Sells
 input double   InpSweepBufferUSD       = 2.00;     // Max allowable sweep penetration outside Asian box ($2.00)
 input int      InpTrendEMA_Slow        = 200;      // Primary Trend Filter EMA (200 EMA)
 input int      InpPullbackEMA_Fast     = 20;       // Pullback Dynamic EMA (20 EMA)
@@ -53,8 +60,8 @@ input int      InpMACDFast             = 12;       // MACD Fast EMA
 input int      InpMACDSlow             = 26;       // MACD Slow EMA
 input int      InpMACDSignal           = 9;        // MACD Signal SMA
 input int      InpATRPeriod            = 14;       // ATR Period for Stop Loss and Trailing
-input double   InpATRFactorSL          = 1.3;      // ATR Multiplier for Stop Loss
-input double   InpATRFactorTrail       = 1.8;      // ATR Multiplier for Trailing Stop
+input double   InpATRFactorSL          = 1.8;      // ATR Multiplier for Stop Loss (Wider buffer to avoid noise wicks)
+input double   InpATRFactorTrail       = 2.2;      // ATR Multiplier for Trailing Stop
 input bool     InpUseTrailingStop      = true;     // Enable ATR Trailing Stop on Runner
 
 //--- Inputs: Friday Volatility & Weekend Risk Filter
@@ -94,6 +101,10 @@ bool      g_AsianBoxFormed        = false;
 double    g_PDH                   = 0.0;
 double    g_PDL                   = 0.0;
 
+// Daily Trade Limiter & Cooldown Tracking
+int       g_DailyTradesCount      = 0;
+datetime  g_LastClosedLossTime    = 0;
+
 string    g_BtnName               = "btn_IntradayResume";
 
 //+------------------------------------------------------------------+
@@ -123,6 +134,8 @@ int OnInit()
    g_RecoveryStage         = 1;
    g_RecoveryStartEquity   = g_InitialBalance;
    g_LastBarTime           = 0;
+   g_DailyTradesCount      = 0;
+   g_LastClosedLossTime    = 0;
 
    // Calculate initial Asian & Daily Levels
    CalculateAsianAndDailyLevels();
@@ -131,7 +144,8 @@ int OnInit()
    CreateResumeButton();
 
    Print("==================================================================");
-   Print("[INIT] XAUUSD Intraday Master Engine v1.00 Initialized (M15).");
+   Print("[INIT] XAUUSD Intraday Master Engine v2.00 Initialized (M15).");
+   Print("[INIT] Max Daily Trades: ", InpMaxDailyTrades, " | SL Cooldown: ", InpCooldownMinutesAfterSL, "m | RSI Filter: ", (InpRequireRSIFilter ? "ACTIVE" : "OFF"));
    Print("[INIT] Asian High: $", DoubleToStr(g_AsianHigh, 2), " | Asian Low: $", DoubleToStr(g_AsianLow, 2),
          " | PDH: $", DoubleToStr(g_PDH, 2), " | PDL: $", DoubleToStr(g_PDL, 2));
    Print("[INIT] Daily Cash Liquidation at: ", InpDailyCloseHourUTC, ":", InpDailyCloseMinuteUTC, " UTC");
@@ -193,11 +207,16 @@ void OnTick()
    // 9. Manage Active Open Intraday Positions (TP1 Partial Close, Break-Even, ATR Trail)
    ManageOpenIntradayTrades();
 
-   // 10. Entry Time Window & Session Checks
+   // 10. Entry Time Window, Max Daily Trades & Session Checks
    if (!IsOrderPlacementAllowed()) return;
    if (g_DailyClosedForGapRisk) return;
    if (g_FridayClosedForLowVol) return;
    if (CountOpenIntradayTrades() > 0) return; // Strictly 1 high-conviction trade at a time
+   if (InpMaxDailyTrades > 0 && g_DailyTradesCount >= InpMaxDailyTrades) return; // Daily trade limit reached
+   if (InpCooldownMinutesAfterSL > 0 && g_LastClosedLossTime > 0)
+   {
+      if (TimeCurrent() - g_LastClosedLossTime < (InpCooldownMinutesAfterSL * 60)) return; // Cooldown after loss active
+   }
    if (!IsSpreadOk()) return;
 
    // 11. Check Intraday Entry Signals
@@ -218,7 +237,9 @@ void CheckDailyReset()
       g_AsianBoxFormed = false;
       g_AsianHigh = 0.0;
       g_AsianLow  = 0.0;
-      Print("[NEW DAY] Daily session reset. Recalibrating Asian Range and Daily Gap guard.");
+      g_DailyTradesCount = 0;
+      g_LastClosedLossTime = 0;
+      Print("[NEW DAY] Daily session reset. Daily trades reset to 0. Recalibrating Asian Range and Daily Gap guard.");
       CalculateAsianAndDailyLevels();
    }
 }
@@ -615,14 +636,18 @@ void CheckAndExecuteIntradayEntry()
    double macdHist_1 = macdMain_1 - macdSig_1;
    double macdHist_2 = macdMain_2 - macdSig_2;
 
-   // 4. Dynamic ATR Stop Loss Calculation
+   // 4. RSI Calculations on M15
+   double rsi_1 = iRSI(Symbol(), PERIOD_M15, InpRSIPeriod, PRICE_CLOSE, 1);
+   double rsi_2 = iRSI(Symbol(), PERIOD_M15, InpRSIPeriod, PRICE_CLOSE, 2);
+
+   // 5. Dynamic ATR Stop Loss Calculation
    double atr = iATR(Symbol(), PERIOD_M15, InpATRPeriod, 1);
    if (atr <= 0) atr = 2.00;
    double slDistUSD = atr * InpATRFactorSL;
 
    double minStopUSD = (MarketInfo(Symbol(), MODE_STOPLEVEL) * Point) + (10 * Point);
    if (slDistUSD < minStopUSD) slDistUSD = minStopUSD;
-   if (slDistUSD < 2.00) slDistUSD = 2.00; // Minimum $2.00 buffer on Gold
+   if (slDistUSD < 2.50) slDistUSD = 2.50; // Minimum $2.50 buffer on Gold M15
 
    double tp1DistUSD = slDistUSD * InpRewardRatioTP1;
    double lot = CalculateDynamicRiskLot(slDistUSD);
@@ -639,12 +664,13 @@ void CheckAndExecuteIntradayEntry()
       bool closedAboveSweep = (close1 > g_AsianLow) && (close1 > open1);
       bool lowerWickRejection = (close1 - low1) >= (high1 - close1);
       bool macdTurningBullish = (macdHist_1 > macdHist_2);
+      bool rsiSweepBuyOk = (!InpRequireRSIFilter) || ((rsi_1 > rsi_2) && (rsi_2 <= InpRSIOversoldBuy || rsi_1 <= 48.0));
 
-      if (sweptLow && closedAboveSweep && lowerWickRejection && macdTurningBullish)
+      if (sweptLow && closedAboveSweep && lowerWickRejection && macdTurningBullish && rsiSweepBuyOk)
       {
          double price = Ask;
-         // Place SL right below the sweep wick tip with small buffer
-         double sweepSLDist = (price - low1) + 0.80;
+         // Place SL right below the sweep wick tip with adequate buffer
+         double sweepSLDist = (price - low1) + 1.20;
          if (sweepSLDist < minStopUSD) sweepSLDist = minStopUSD;
          if (sweepSLDist < slDistUSD)  sweepSLDist = slDistUSD;
 
@@ -655,9 +681,12 @@ void CheckAndExecuteIntradayEntry()
          int ticket = OrderSend(Symbol(), OP_BUY, lot, price, InpSlippage, sl, tp1, comment, InpMagicNumber, 0, clrDodgerBlue);
          if (ticket > 0)
          {
+            g_DailyTradesCount++;
             Print("[SWEEP BUY EXECUTED] Order #", ticket, " ", DoubleToStr(lot, 2), " lots @ ", price,
                   " | Reason: Asian/PDL Liquidity Sweep Reversal",
                   " | Asian Low: $", DoubleToStr(g_AsianLow, 2), " | Sweep Low: $", DoubleToStr(low1, 2),
+                  " | RSI: ", DoubleToStr(rsi_1, 1), " (Slope +)",
+                  " | Daily Trade #", g_DailyTradesCount, " of ", InpMaxDailyTrades,
                   " | SL: ", sl, " | TP1: ", tp1);
             g_PartialClosed = false;
             g_LastBarTime = currentBarTime;
@@ -670,12 +699,13 @@ void CheckAndExecuteIntradayEntry()
       bool closedBelowSweep = (close1 < g_AsianHigh) && (close1 < open1);
       bool upperWickRejection = (high1 - close1) >= (close1 - low1);
       bool macdTurningBearish = (macdHist_1 < macdHist_2);
+      bool rsiSweepSellOk = (!InpRequireRSIFilter) || ((rsi_1 < rsi_2) && (rsi_2 >= InpRSIOverboughtSell || rsi_1 >= 52.0));
 
-      if (sweptHigh && closedBelowSweep && upperWickRejection && macdTurningBearish)
+      if (sweptHigh && closedBelowSweep && upperWickRejection && macdTurningBearish && rsiSweepSellOk)
       {
          double price = Bid;
-         // Place SL right above the sweep wick tip with small buffer
-         double sweepSLDist = (high1 - price) + 0.80;
+         // Place SL right above the sweep wick tip with adequate buffer
+         double sweepSLDist = (high1 - price) + 1.20;
          if (sweepSLDist < minStopUSD) sweepSLDist = minStopUSD;
          if (sweepSLDist < slDistUSD)  sweepSLDist = slDistUSD;
 
@@ -686,9 +716,12 @@ void CheckAndExecuteIntradayEntry()
          int ticket = OrderSend(Symbol(), OP_SELL, lot, price, InpSlippage, sl, tp1, comment, InpMagicNumber, 0, clrCrimson);
          if (ticket > 0)
          {
+            g_DailyTradesCount++;
             Print("[SWEEP SELL EXECUTED] Order #", ticket, " ", DoubleToStr(lot, 2), " lots @ ", price,
                   " | Reason: Asian/PDH Liquidity Sweep Reversal",
                   " | Asian High: $", DoubleToStr(g_AsianHigh, 2), " | Sweep High: $", DoubleToStr(high1, 2),
+                  " | RSI: ", DoubleToStr(rsi_1, 1), " (Slope -)",
+                  " | Daily Trade #", g_DailyTradesCount, " of ", InpMaxDailyTrades,
                   " | SL: ", sl, " | TP1: ", tp1);
             g_PartialClosed = false;
             g_LastBarTime = currentBarTime;
@@ -709,8 +742,9 @@ void CheckAndExecuteIntradayEntry()
       bool pulledBackBuy = (Low[1] <= ema20 || Low[2] <= ema20);
       bool rejectedUpBuy = (close1 >= ema20 && close1 > open1);
       bool macdBullishExpanding = (macdMain_1 > macdSig_1) && (macdHist_1 > macdHist_2 && macdHist_1 > 0);
+      bool rsiRetestBuyOk = (!InpRequireRSIFilter) || ((rsi_1 > rsi_2) && (rsi_1 >= 44.0 && rsi_1 <= 64.0));
 
-      if (trendBullish && pulledBackBuy && rejectedUpBuy && macdBullishExpanding)
+      if (trendBullish && pulledBackBuy && rejectedUpBuy && macdBullishExpanding && rsiRetestBuyOk)
       {
          double price = Ask;
          double sl    = NormalizeDouble(price - slDistUSD, Digits);
@@ -720,9 +754,12 @@ void CheckAndExecuteIntradayEntry()
          int ticket = OrderSend(Symbol(), OP_BUY, lot, price, InpSlippage, sl, tp1, comment, InpMagicNumber, 0, clrDodgerBlue);
          if (ticket > 0)
          {
+            g_DailyTradesCount++;
             Print("[RETEST BUY EXECUTED] Order #", ticket, " ", DoubleToStr(lot, 2), " lots @ ", price,
                   " | Reason: Momentum Break & EMA20 Retest",
                   " | MACD Hist: ", DoubleToStr(macdHist_1, 3), " > ", DoubleToStr(macdHist_2, 3),
+                  " | RSI: ", DoubleToStr(rsi_1, 1), " (Bullish Momentum)",
+                  " | Daily Trade #", g_DailyTradesCount, " of ", InpMaxDailyTrades,
                   " | SL: ", sl, " | TP1: ", tp1);
             g_PartialClosed = false;
             g_LastBarTime = currentBarTime;
@@ -734,8 +771,9 @@ void CheckAndExecuteIntradayEntry()
       bool pulledBackSell = (High[1] >= ema20 || High[2] >= ema20);
       bool rejectedDownSell = (close1 <= ema20 && close1 < open1);
       bool macdBearishExpanding = (macdMain_1 < macdSig_1) && (macdHist_1 < macdHist_2 && macdHist_1 < 0);
+      bool rsiRetestSellOk = (!InpRequireRSIFilter) || ((rsi_1 < rsi_2) && (rsi_1 <= 56.0 && rsi_1 >= 36.0));
 
-      if (trendBearish && pulledBackSell && rejectedDownSell && macdBearishExpanding)
+      if (trendBearish && pulledBackSell && rejectedDownSell && macdBearishExpanding && rsiRetestSellOk)
       {
          double price = Bid;
          double sl    = NormalizeDouble(price + slDistUSD, Digits);
@@ -745,9 +783,12 @@ void CheckAndExecuteIntradayEntry()
          int ticket = OrderSend(Symbol(), OP_SELL, lot, price, InpSlippage, sl, tp1, comment, InpMagicNumber, 0, clrCrimson);
          if (ticket > 0)
          {
+            g_DailyTradesCount++;
             Print("[RETEST SELL EXECUTED] Order #", ticket, " ", DoubleToStr(lot, 2), " lots @ ", price,
                   " | Reason: Momentum Break & EMA20 Retest",
                   " | MACD Hist: ", DoubleToStr(macdHist_1, 3), " < ", DoubleToStr(macdHist_2, 3),
+                  " | RSI: ", DoubleToStr(rsi_1, 1), " (Bearish Momentum)",
+                  " | Daily Trade #", g_DailyTradesCount, " of ", InpMaxDailyTrades,
                   " | SL: ", sl, " | TP1: ", tp1);
             g_PartialClosed = false;
             g_LastBarTime = currentBarTime;
@@ -846,6 +887,42 @@ void ManageOpenIntradayTrades()
          }
       }
    }
+
+   // 3. Monitor closed trades in history for recent SL loss
+   CheckRecentHistoryForLoss();
+}
+
+//+------------------------------------------------------------------+
+//| Check history pool to see if our most recent trade was an SL hit |
+//+------------------------------------------------------------------+
+void CheckRecentHistoryForLoss()
+{
+   if (InpCooldownMinutesAfterSL <= 0) return;
+
+   int histTotal = OrdersHistoryTotal();
+   if (histTotal <= 0) return;
+
+   for (int i = histTotal - 1; i >= 0 && i >= histTotal - 10; i--)
+   {
+      if (OrderSelect(i, SELECT_BY_POS, MODE_HISTORY))
+      {
+         if (OrderSymbol() == Symbol() && OrderMagicNumber() == InpMagicNumber)
+         {
+            datetime closeTime = OrderCloseTime();
+            if (closeTime > g_LastClosedLossTime)
+            {
+               if (OrderProfit() < 0)
+               {
+                  g_LastClosedLossTime = closeTime;
+                  Print("[SL COOLDOWN TRIGGERED] Trade #", OrderTicket(), " closed at loss ($",
+                        DoubleToStr(OrderProfit(), 2), "). Cooldown active for ", InpCooldownMinutesAfterSL,
+                        " minutes to prevent whipsaw re-entries.");
+               }
+            }
+            break; // Found the most recently closed trade for this EA
+         }
+      }
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -928,6 +1005,7 @@ void UpdateHUD()
 
    double ema200 = iMA(Symbol(), PERIOD_M15, InpTrendEMA_Slow, 0, MODE_EMA, PRICE_CLOSE, 1);
    string trend = (Close[1] > ema200) ? "BULLISH (M15 > 200 EMA)" : "BEARISH (M15 < 200 EMA)";
+   double rsiVal = iRSI(Symbol(), PERIOD_M15, InpRSIPeriod, PRICE_CLOSE, 1);
 
    string sessionPhase = GetCurrentSessionPhase();
 
@@ -969,7 +1047,14 @@ void UpdateHUD()
    hud += "----------------------------------------------------\n";
    hud += StringConcatenate("  Asian Range (M15) : High: $", DoubleToStr(g_AsianHigh, 2), " | Low: $", DoubleToStr(g_AsianLow, 2), "\n");
    hud += StringConcatenate("  Daily Range (PDH) : High: $", DoubleToStr(g_PDH, 2), " | Low: $", DoubleToStr(g_PDL, 2), "\n");
+   hud += StringConcatenate("  RSI Indicator     : ", DoubleToStr(rsiVal, 1), " (", (rsiVal >= 50.0 ? "Bullish Territory" : "Bearish Territory"), ")\n");
    hud += StringConcatenate("  Session Phase     : ", sessionPhase, "\n");
+   hud += StringConcatenate("  Daily Trades Taken: ", g_DailyTradesCount, " / ", InpMaxDailyTrades, (g_DailyTradesCount >= InpMaxDailyTrades ? " [MAX LIMIT REACHED]" : ""), "\n");
+   if (InpCooldownMinutesAfterSL > 0 && g_LastClosedLossTime > 0 && (TimeCurrent() - g_LastClosedLossTime < (InpCooldownMinutesAfterSL * 60)))
+   {
+      int remainSec = (InpCooldownMinutesAfterSL * 60) - int(TimeCurrent() - g_LastClosedLossTime);
+      hud += StringConcatenate("  Loss Cooldown     : ACTIVE (", remainSec / 60, "m ", remainSec % 60, "s remaining)\n");
+   }
    hud += StringConcatenate("  Daily Cash Target : Closes to 100% Cash at ", InpDailyCloseHourUTC, ":", InpDailyCloseMinuteUTC, " UTC\n");
    hud += StringConcatenate("  Trend Bias (M15)  : ", trend, "\n");
    hud += StringConcatenate("  Active Trades     : ", CountOpenIntradayTrades(), " trade(s)\n");
